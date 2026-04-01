@@ -9,12 +9,14 @@ use byteorder::{ ReadBytesExt, BigEndian };
 use crate::*;
 use crate::tags_impl::*;
 
-pub fn parse<T: Read + Seek, F: Fn(f64), P>(stream: &mut T, size: usize, progress_cb: F, cancel_flag: Arc<AtomicBool>, metadata_only: Option<&mut util::VideoMetadata>, options: &crate::InputOptions, parse_fn: P) -> Result<Vec<SampleInfo>>
+pub fn parse<T: Read + Seek, F: Fn(f64), P>(stream: &mut T, size: usize, progress_cb: F, cancel_flag: Arc<AtomicBool>, metadata_only: Option<&mut util::VideoMetadata>, options: &crate::InputOptions, parse_fn: P) -> Result<(Vec<SampleInfo>, Option<String>, Option<String>)>
 where P: Fn(&[u8], &crate::InputOptions, &mut GroupedTagMap) -> Result<()> {
     let mut stream = std::io::BufReader::with_capacity(128*1024, stream);
     let mut samples = Vec::new();
 
     let mut frame_rate = 25.0;
+    let mut creation_time: Option<String> = None;
+    let mut creation_time_subsec: Option<String> = None;
 
     let mut index = 0;
     let mut id = [0u8; 16];
@@ -44,6 +46,19 @@ where P: Fn(&[u8], &crate::InputOptions, &mut GroupedTagMap) -> Result<()> {
         }
 
         // log::debug!("{}: {}", util::to_hex(&id), length);
+
+        if id == [0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0d, 0x01, 0x01, 0x01, 0x01, 0x01, 0x2f, 0x00] { // Preface Set
+            let mut data = vec![0; length];
+            stream.read_exact(&mut data)?;
+            if let Ok(set) = parse_set(&data) {
+                if let Some(ts) = set.get(&MxfMetaTag::LastModifiedDate).and_then(|x| x.as_str()) {
+                    creation_time = Some(ts.to_string());
+                }
+                if let Some(ss) = set.get(&MxfMetaTag::LastModifiedDateSubsec).and_then(|x| x.as_str()) {
+                    creation_time_subsec = Some(ss.to_string());
+                }
+            }
+        }
 
         if id == [0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0D, 0x01, 0x01, 0x01, 0x01, 0x01, 0x11, 0x00] { // SourceClip
             let mut data = vec![0; length];
@@ -75,7 +90,7 @@ where P: Fn(&[u8], &crate::InputOptions, &mut GroupedTagMap) -> Result<()> {
                         height: data.get(&MxfMetaTag::DisplayHeight).and_then(|x| x.as_u64()).unwrap_or_default() as usize,
                         rotation: 0,
                     };
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), creation_time, creation_time_subsec));
                 }
             }
         }
@@ -118,7 +133,7 @@ where P: Fn(&[u8], &crate::InputOptions, &mut GroupedTagMap) -> Result<()> {
         }
     }
 
-    Ok(samples)
+    Ok((samples, creation_time, creation_time_subsec))
 }
 
 fn read_ber<T: Read + Seek>(stream: &mut T) -> Result<usize> {
@@ -190,7 +205,9 @@ enum MxfMetaTag {
     DisplayXOffset,
     DisplayYOffset,
     AspectRatio,
-    ColorRange
+    ColorRange,
+    LastModifiedDate,
+    LastModifiedDateSubsec
 }
 
 fn parse_set(buffer: &[u8]) -> Result<BTreeMap<MxfMetaTag, serde_json::Value>> {
@@ -220,6 +237,23 @@ fn parse_set(buffer: &[u8]) -> Result<BTreeMap<MxfMetaTag, serde_json::Value>> {
             0x320B => { map.insert(MxfMetaTag::DisplayYOffset,      slice.read_u32::<BigEndian>()?.into()); },
             0x320E => { map.insert(MxfMetaTag::AspectRatio,         (slice.read_u32::<BigEndian>()? as f64 / slice.read_u32::<BigEndian>()? as f64).into()); },
             0x3306 => { map.insert(MxfMetaTag::ColorRange,          slice.read_u32::<BigEndian>()?.into()); },
+            0x3B02 => {
+                if length >= 8 {
+                    let year  = slice.read_u16::<BigEndian>()?;
+                    let month = slice.read_u8()?;
+                    let day   = slice.read_u8()?;
+                    let hour  = slice.read_u8()?;
+                    let min   = slice.read_u8()?;
+                    let sec   = slice.read_u8()?;
+                    let msec_quarter = slice.read_u8()?;
+                    let ts = format!("{:04}:{:02}:{:02} {:02}:{:02}:{:02}", year, month, day, hour, min, sec);
+                    map.insert(MxfMetaTag::LastModifiedDate, ts.into());
+                    let msec = (msec_quarter as u32) * 4;
+                    map.insert(MxfMetaTag::LastModifiedDateSubsec, format!("{:03}", msec).into());
+                } else {
+                    slice.seek(SeekFrom::Current(length as i64))?;
+                }
+            },
             _ => {
                 slice.seek(SeekFrom::Current(length as i64))?;
             }

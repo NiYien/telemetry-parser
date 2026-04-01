@@ -1,0 +1,22 @@
+{
+  "version": 1,
+
+  "models": {
+    "GR IV":   { "sw": 23.5, "fixed_fl": 28 },
+    "GR IIIx": { "sw": 23.5, "fixed_fl": 40 },
+    "GR III":  { "sw": 23.5, "fixed_fl": 28 },
+    "GR II":   { "sw": 23.5, "fixed_fl": 28 },
+    "GR":      { "sw": 23.5, "fixed_fl": 28 }
+  },
+
+  "readout": {
+    "columns": ["8K60","8K30","8K24","4K240","4K120","4K60","4K30","4K24","1K240","1K120","1K60","1K30","1K24"],
+    "data": {
+      "GR IV":   [ null,  null,  null,  null,  null,  null,  null,  null,  null,   -10,-14.1,-14.1,-14.1],
+      "GR IIIx": [ null,  null,  null,  null,  null,  null,  null,  null,  null,   -10,-14.1,-14.1,-14.1],
+      "GR III":  [ null,  null,  null,  null,  null,  null,  null,  null,  null,   -10,-14.1,-14.1,-14.1],
+      "GR II":   [ null,  null,  null,  null,  null,  null,  null,  null,  null,   -10,-14.1,-14.1,-14.1],
+      "GR":      [ null,  null,  null,  null,  null,  null,  null,  null,  null,   -10,-14.1,-14.1,-14.1]
+    }
+  }
+}

@@ -46,6 +46,7 @@ declare_ids! {
     SensorWidth,
     SensorHeight,
     FrameRate,
+    RecordFrameRate,
     SensorReadoutMode,
     ShutterAngle,
     ShutterSpeed,
@@ -78,6 +79,9 @@ declare_ids! {
     PixelHeight,
     RollingShutterCorrection,
     SerialNumber,
+    CreationDate,
+    TimeZoneOffset,
+    CreationDateUtc,
 
     Name,
     DisplayName,

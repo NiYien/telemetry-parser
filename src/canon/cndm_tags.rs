@@ -77,8 +77,11 @@ pub fn get_tag(tag: u16, tag_data: &[u8]) -> TagDescription {
             }
             Ok(ret)
         }, tag_data),
+        // NOTE: The date/time fields below are LOCAL time, but and_utc().timestamp_millis() interprets them as UTC.
+        // The resulting TimestampMs value is "local time naively treated as UTC millis", NOT true UTC.
+        // Canon process_map() reverses this by applying the TZ offset to recover both local and true UTC.
         0xe227 => tag!(Default, TimestampMs, "Timestamp per frame", f64, "{:?}", |d| {
-            let _tz_dst = d.read_u8()?; // 0 - standard time, 1 - Summertime
+            let _tz_dst      = d.read_u8()?; // 0 - standard time, 1 - Summertime
             let _tz_hour_sign = d.read_u8()?; // 0: Positive number (Local time is faster than UTC); 1: Negative number (Local time is behind UTC)
             let _tz_hour      = d.read_u8()?; // Absolute difference in time with the UTC (Hour). Note: FF is invalid value.
             let _tz_minute    = d.read_u8()?; // Absolute difference in time with the UTC (Minute). Note: FF is invalid value.
@@ -149,4 +152,18 @@ fn read_utf8(d: &mut Cursor::<&[u8]>) -> Result<String> {
 
 fn read_uuid(d: &mut Cursor::<&[u8]>) -> Result<(u32,u32,u32,u32)> {
     Ok((d.read_u32::<BigEndian>()?, d.read_u32::<BigEndian>()?, d.read_u32::<BigEndian>()?, d.read_u32::<BigEndian>()?))
+}
+
+/// Extract timezone string from CNDM 0xE227 tag data.
+/// Returns "+HH:MM" or "-HH:MM", or None if invalid.
+pub fn extract_timezone(tag_data: &[u8]) -> Option<String> {
+    if tag_data.len() < 4 { return None; }
+    let mut d = Cursor::new(tag_data);
+    let _tz_dst       = d.read_u8().ok()?;
+    let tz_hour_sign  = d.read_u8().ok()?; // 0: positive (east), 1: negative (west)
+    let tz_hour       = d.read_u8().ok()?;
+    let tz_minute     = d.read_u8().ok()?;
+    if tz_hour == 0xFF || tz_minute == 0xFF { return None; }
+    let sign = if tz_hour_sign == 0 { '+' } else { '-' };
+    Some(format!("{}{:02}:{:02}", sign, tz_hour, tz_minute))
 }

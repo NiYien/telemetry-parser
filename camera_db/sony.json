@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "aliases": { "ILME-": "ILCE-" },
+
+  "models": {
+    "ILCE-1":    { "sw": 35.9 },
+    "ILCE-7SM3": { "sw": 35.9 },
+    "ILCE-7SM2": { "sw": 35.9 },
+    "ILCE-7S":   { "sw": 35.9 },
+    "ILCE-7RM4": { "sw": 35.9 },
+    "ILCE-7RM3": { "sw": 35.9 },
+    "ILCE-7RM2": { "sw": 35.9 },
+    "ILCE-7M3":  { "sw": 35.9 },
+    "ILCE-7M2":  { "sw": 35.9 },
+    "ILCE-7":    { "sw": 35.9 },
+    "ILCE-FX3":  { "sw": 35.9 },
+    "ILCE-6600": { "sw": 23.5 },
+    "ILCE-6500": { "sw": 23.5 },
+    "ILCE-6400": { "sw": 23.5 },
+    "ILCE-6300": { "sw": 23.5 },
+    "ILCE-6100": { "sw": 23.5 },
+    "ZVE1":      { "sw": 35.9 },
+    "ZVE10":     { "sw": 23.5 },
+    "RX100VA":   { "sw": 35.9 },
+    "RX1RM2":    { "sw": 35.9 },
+    "RX10M4":    { "sw": 35.9 }
+  },
+
+  "crop": [
+    { "m": ["ILCE-1"],    "va": "FULL", "w": [3840], "fps": [100,120], "c": 1.1 },
+    { "m": ["ILCE-1"],    "va": "FULL", "w": [1920], "fps": [200,240], "c": 1.2 },
+    { "m": ["ILCE-1"],    "va": "APSC", "c": 1.523 },
+
+    { "m": ["RX10M4","RX100VA"], "w": [3840], "c": 1.07 },
+    { "m": ["RX1RM2"], "c": 1.07 },
+
+    { "m": ["ILCE-6100"], "w": [3840], "fps": [25,30], "c": 1.2 },
+    { "m": ["ILCE-6100"], "w": [1920], "fps": [100,120], "c": 1.8 },
+
+    { "m": ["ILCE-6300","ILCE-6500"], "w": [3840], "fps": [25,30], "c": 1.2 },
+    { "m": ["ILCE-6300","ILCE-6500"], "w": [1920], "fps": [100,120], "c": 1.2 },
+
+    { "m": ["ILCE-6400","ILCE-6600","ZVE10"], "w": [3840], "fps": [25,30], "c": 1.2 },
+    { "m": ["ILCE-6400","ILCE-6600","ZVE10"], "w": [1920], "fps": [100,120], "c": 1.2 },
+
+    { "m": ["ILCE-7M3"], "va": "FULL", "w": [3840], "fps": [25,30], "c": 1.2 },
+    { "m": ["ILCE-7M3"], "va": "APSC", "c": 1.523 },
+
+    { "m": ["ILCE-7SM2","ILCE-7S"], "va": "APSC", "c": 1.523 },
+    { "m": ["ILCE-7SM2","ILCE-7S"], "w": [1920], "fps": [100,100], "c": 2.2 },
+
+    { "m": ["ZVE1","ILCE-7SM3"], "va": "FULL", "w": [3840], "fps": [100,120], "c": 1.1 },
+    { "m": ["ZVE1","ILCE-7SM3"], "va": "APSC", "c": 1.523 },
+
+    { "m": ["ILCE-FX3"], "va": "FULL", "w": [3840], "fps": [100,120], "c": 1.2 },
+    { "m": ["ILCE-FX3"], "va": "APSC", "c": 1.523 },
+
+    { "m": ["ILCE-7RM3","ILCE-7RM2","ILCE-7M2"], "va": "APSC", "c": 1.523 },
+
+    { "m": ["ILCE-7RM4"], "va": "APSC", "w": [3840], "fps": [25,25], "c": 1.6 },
+    { "m": ["ILCE-7RM4"], "va": "APSC", "w": [3840], "fps": [30,30], "c": 1.8 }
+  ],
+
+  "readout": {
+    "columns": ["8K60","8K30","8K24","4K240","4K120","4K60","4K30","4K24","1K240","1K120","1K60","1K30","1K24"],
+    "data": {
+      "ILCE-1":    [null, 15.4, 15.4, 6.08, 5.3, 5.3, 8, 8, 6.08, 5.3, 5.3, 5.3, 5.3],
+      "ILCE-7SM3": [null, null, null, 7.69, 7.6, null, 8.8, 8.8, 7.69, 7.6, 8.8, 8.8, 8.8],
+      "ILCE-7SM2": [null, null, null, null, null, null, -31, -31, null, -7.9, -15, -15, -15],
+      "ILCE-7S":   [null, null, null, null, null, null, -31, -31, null, -7.9, -15, -15, -15],
+      "ILCE-7RM4": [null, null, null, null, null, null, 25, 31, null, 7.3, 13, 13, 13],
+      "ILCE-7RM3": [null, null, null, null, null, null, 15.5, 15.5, null, 7.9, 7.9, 7.9, 7.9],
+      "ILCE-7RM2": [null, null, null, null, null, null, 31, 31, null, 7.9, 15, 15, 15],
+      "ILCE-7M3":  [null, null, null, null, null, null, 17.2, 24.6, null, 7.1, 7.1, 7.1, 7.1],
+      "ILCE-7M2":  [null, null, null, null, null, null, -31, -31, null, -7.9, -15, -15, -15],
+      "ILCE-7":    [null, null, null, null, null, null, null, null, null, -7.9, -15, -15, -15],
+      "ILCE-FX3":  [null, null, null, 7.69, 7.6, null, 8.7, 8.7, 7.69, 7.6, 8.7, 8.7, 8.7],
+      "ILCE-6600": [null, null, null, null, null, null, -32, -40, null, -7.5, -13, -13, -13],
+      "ILCE-6500": [null, null, null, null, null, null, 32, 40, null, 7.5, 13, 13, 13],
+      "ILCE-6400": [null, null, null, null, null, null, 32, 40, null, 7.5, 13, 13, 13],
+      "ILCE-6300": [null, null, null, null, null, null, 32, 40, null, 7.5, 13, 13, 13],
+      "ILCE-6100": [null, null, null, null, null, null, 32, 40, null, 7.5, 13, 13, 13],
+      "ZVE1":      [null, null, null, 9.2, 7.5, null, 9.2, 9.2, 9.2, 7.5, 8.5, 8.5, 8.5],
+      "ZVE10":     [null, null, null, null, null, null, 33, 40, null, -7.3, -13, -13, -13],
+      "RX100VA":   [null, null, null, null, null, null, -8.8, -8.8, -7.69, -7.6, -8.8, -8.8, -8.8],
+      "RX1RM2":    [null, null, null, null, null, null, null, null, null, -10, -15, -15, -15],
+      "RX10M4":    [null, null, null, null, null, null, -8.8, -8.8, -7.69, -7.6, -8.8, -8.8, -8.8]
+    }
+  }
+}

@@ -23,9 +23,17 @@ struct Opts {
     #[argh(switch, short = 'd')]
     dump: bool,
 
+    /// print summary of key fields (crop, readout, resolution, focal length)
+    #[argh(switch, short = 's')]
+    summary: bool,
+
     /// IMU orientation (XYZ, ZXY etc, lowercase is negative, eg. xZy)
     #[argh(option)]
     imuo: Option<String>,
+
+    /// path to camera_db directory containing per-brand JSON files
+    #[argh(option)]
+    camera_db: Option<String>,
 }
 
 fn main() {
@@ -35,7 +43,10 @@ fn main() {
     let mut stream = std::fs::File::open(&opts.input).unwrap();
     let filesize = stream.metadata().unwrap().len() as usize;
 
-    let input = Input::from_stream(&mut stream, filesize, &opts.input, |_|(), Arc::new(AtomicBool::new(false))).unwrap();
+    let mut options = InputOptions::default();
+    options.camera_db_path = opts.camera_db;
+
+    let input = Input::from_stream_with_options(&mut stream, filesize, &opts.input, |_|(), Arc::new(AtomicBool::new(false)), options).unwrap();
 
     let mut i = 0;
     println!("Detected camera: {} {}", input.camera_type(), input.camera_model().unwrap_or(&"".into()));
@@ -52,6 +63,56 @@ fn main() {
                     println!("{: <25} {: <25} {: <50}: {}", format!("{}", group), format!("{}", tagid), taginfo.description, &taginfo.value.to_string());
                 }
             }
+        }
+    }
+
+    if opts.summary {
+        // Collect key fields from first sample's tag_map
+        if let Some(map) = samples.first().and_then(|s| s.tag_map.as_ref()) {
+            let get_str = |g: GroupId, t: TagId| -> String {
+                map.get(&g).and_then(|m| m.get(&t)).map(|v| v.value.to_string()).unwrap_or_else(|| "-".to_string())
+            };
+            let get_custom = |g: GroupId, name: &str| -> String {
+                map.get(&g).and_then(|m| m.get(&TagId::Custom(std::borrow::Cow::Owned(name.to_owned())))).map(|v| v.value.to_string()).unwrap_or_else(|| "-".to_string())
+            };
+
+            let model = get_str(GroupId::Default, TagId::Name);
+            let crop = get_custom(GroupId::Default, "crop_factor");
+            let readout = get_str(GroupId::Imager, TagId::FrameReadoutTime);
+            let readout_est = get_custom(GroupId::Imager, "readout_estimated");
+            // Resolution: prefer video output resolution, fallback to CNDM sensor pixels
+            let video_w = get_custom(GroupId::Default, "video_width");
+            let video_h = get_custom(GroupId::Default, "video_height");
+            let pixel_w = if video_w != "-" { video_w } else { get_str(GroupId::Imager, TagId::PixelWidth) };
+            let pixel_h = if video_h != "-" { video_h } else { get_str(GroupId::Imager, TagId::PixelHeight) };
+            let sensor_pixel_w = get_str(GroupId::Imager, TagId::PixelWidth);
+            let sensor_pixel_h = get_str(GroupId::Imager, TagId::PixelHeight);
+            let lens = get_str(GroupId::Lens, TagId::DisplayName);
+            let focal = get_str(GroupId::Lens, TagId::FocalLength);
+            let pixel_focal = get_str(GroupId::Lens, TagId::PixelFocalLength);
+            let canon_fine = get_custom(GroupId::Default, "canon_fine");
+            let canon_crop = get_custom(GroupId::Default, "canon_crop");
+            let scale_35mm = get_custom(GroupId::Default, "scale_35mm");
+            let sensor_w = get_str(GroupId::Default, TagId::Custom(std::borrow::Cow::Owned("SensorWidth".to_owned())));
+
+            let est_mark = if readout_est == "true" { " *" } else { "" };
+
+            println!("Model:            {}", model);
+            println!("Resolution:       {} x {}", pixel_w, pixel_h);
+            if sensor_pixel_w != pixel_w || sensor_pixel_h != pixel_h {
+                println!("Sensor pixels:    {} x {}", sensor_pixel_w, sensor_pixel_h);
+            }
+            println!("Crop factor:      {}", crop);
+            println!("Readout time:     {}{}", readout, est_mark);
+            println!("Focal length:     {}", focal);
+            let unit_pixel_fl = get_custom(GroupId::Lens, "unit_pixel_focal_length");
+            println!("Pixel focal len:  {}", pixel_focal);
+            println!("Unit pixel FL:    {}", unit_pixel_fl);
+            println!("Lens:             {}", lens);
+            println!("Sensor width:     {}", sensor_w);
+            println!("Scale 35mm:       {}", scale_35mm);
+            println!("Canon fine:       {}", canon_fine);
+            println!("Canon crop:       {}", canon_crop);
         }
     }
 

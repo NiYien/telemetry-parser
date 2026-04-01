@@ -23,6 +23,13 @@ mod senseflow;
 mod freefly;
 mod canon;
 mod nikon;
+mod ricoh;
+mod sigma;
+mod leica;
+mod panasonic;
+mod fujifilm;
+pub mod camera_db;
+pub mod tiff_ifd;
 
 pub mod tags_impl;
 pub mod util;
@@ -53,6 +60,10 @@ pub struct InputOptions {
     pub tag_blacklist: HashSet<TagFilter>,
     /// If the main file doesn't contain any data, don't look for sidecar files
     pub dont_look_for_sidecar_files: bool,
+    /// Path to camera_db directory containing per-brand JSON files
+    pub camera_db_path: Option<String>,
+    /// User-provided focal length in mm (for manual lenses without electronic contacts)
+    pub user_focal_length: Option<f64>,
 }
 
 macro_rules! impl_formats {
@@ -78,7 +89,7 @@ macro_rules! impl_formats {
                 } else if size as u64 > 5u64*1024*1024*1024 { // If file is greater than 5 GB, read 10 MB header/footer
                     10
                 } else {
-                    4
+                    10
                 };
                 let buf = util::read_beginning_and_end(stream, size, read_mb*1024*1024)?;
                 if buf.is_empty() {
@@ -90,7 +101,7 @@ macro_rules! impl_formats {
                     let mut check = true;
                     if !exts.is_empty() {
                         if let Some(ref ext) = ext {
-                            if !exts.contains(&ext.as_str()) { check = false; }
+                            if !exts.contains(&ext.as_str()) && ext != "dng" { check = false; }
                         }
                     }
                     if check {
@@ -157,6 +168,11 @@ impl_formats! {
     Sony      => sony::Sony,
     Canon     => canon::Canon,
     Nikon     => nikon::Nikon,
+    Ricoh     => ricoh::Ricoh,
+    Sigma     => sigma::Sigma,
+    Panasonic => panasonic::Panasonic,
+    Leica     => leica::Leica,
+    Fujifilm  => fujifilm::Fujifilm,
     Dji       => dji::Dji,
     Xtra      => xtra::Xtra,
     Insta360  => insta360::Insta360,

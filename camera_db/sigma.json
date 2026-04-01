@@ -1,0 +1,23 @@
+{
+  "version": 1,
+
+  "models": {
+    "BF":   { "sw": 35.9 },
+    "fp L": { "sw": 35.9 },
+    "fp":   { "sw": 35.9 }
+  },
+
+  "crop": [
+    { "m": ["fp", "fp L"], "c": 1.07 },
+    { "m": ["BF"],         "c": 1.05 }
+  ],
+
+  "readout": {
+    "columns": ["8K60","8K30","8K24","4K240","4K120","4K60","4K30","4K24","1K240","1K120","1K60","1K30","1K24"],
+    "data": {
+      "fp":   [ null,  null,  null,  null,  null,  null,  20.8,  20.8,  null,  null,  10.8,  10.8,  10.8],
+      "fp L": [ null,  null,  null,  null,  null,  null,  20.8,  20.8,  null,  null,  10.8,  10.8,  10.8],
+      "BF":   [ null,  null,  null,  null,   7.8,  10.4,  20.9,  20.9,  null,   7.8,  10.4,  20.9,  20.9]
+    }
+  }
+}

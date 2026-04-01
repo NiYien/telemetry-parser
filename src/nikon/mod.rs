@@ -9,12 +9,18 @@ use crate::*;
 use crate::tags_impl::*;
 use memchr::memmem;
 
+
 #[derive(Default)]
 pub struct Nikon {
     pub model: Option<String>,
     pub lens: Option<String>,
-    record_framerate: Option<f64>,
+    record_frame_rate: Option<f64>,
+    playback_frame_rate: Option<f64>,
     frame_readout_time: Option<f64>,
+    mvhd_creation_time: Option<String>,
+    electronic_vr: Option<u32>,
+    vibration_reduction: Option<u8>,
+    is_r3d: bool,
 }
 impl Nikon {
     pub fn camera_type(&self) -> String {
@@ -33,13 +39,21 @@ impl Nikon {
         v
     }
 
-    pub fn detect<P: AsRef<std::path::Path>>(buffer: &[u8], _filepath: P, _options: &crate::InputOptions) -> Option<Self> {
+    pub fn detect<P: AsRef<std::path::Path>>(buffer: &[u8], filepath: P, _options: &crate::InputOptions) -> Option<Self> {
         if memmem::find(buffer, b"Nikon").is_some() && memmem::find(buffer, b"NCTG").is_some() {
+            let is_r3d = filepath.as_ref().extension()
+                .map(|e| e.to_ascii_lowercase() == "r3d")
+                .unwrap_or(false);
             return Some(Self {
                 model: None,
                 lens: None,
-                record_framerate: None,
-                frame_readout_time: None
+                record_frame_rate: None,
+                playback_frame_rate: None,
+                frame_readout_time: None,
+                mvhd_creation_time: util::extract_mvhd_creation_time(buffer),
+                electronic_vr: None,
+                vibration_reduction: None,
+                is_r3d,
             });
         }
         None
@@ -69,7 +83,9 @@ impl Nikon {
         }
         stream.seek(SeekFrom::Start(0))?;
 
-        util::get_track_samples(stream, size, mp4parse::TrackType::Video, true, None, |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
+        // NEV frames are ~3.3MB each but metadata (NRFH) is in the first ~1KB.
+        // Limit read size to avoid loading full RAW pixel data for every frame.
+        util::get_track_samples(stream, size, mp4parse::TrackType::Video, true, Some(4096), |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
             if size > 0 {
                 progress_cb(file_position as f64 / size as f64);
             }
@@ -88,6 +104,12 @@ impl Nikon {
                 ..Default::default()
             });
         }
+
+        // Get video track metadata (resolution, fps)
+        stream.seek(SeekFrom::Start(0))?;
+        let video_md = util::get_video_metadata(stream, size).ok();
+
+        self.process_map(&mut samples, &options, video_md.as_ref());
 
         Ok(samples)
     }
@@ -194,20 +216,22 @@ impl Nikon {
                     self.model = Some(model.clone());
                     md.insert("camera_model".into(), model.into());
                 }
-                0x0000_0016 => { // Framerate
+                0x0000_0016 => { // Framerate (playback)
                     if let Some(fps) = as_rational() {
-                        self.record_framerate = Some(fps);
+                        self.playback_frame_rate = Some(fps);
+                        self.record_frame_rate = Some(fps);
                         util::insert_tag(map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:.3}", v), fps, vec![]), options);
                         md.insert("framerate".into(), fps.into());
                     }
                 }
-                0x0000_0017 => { // Record Framerate
+                0x0000_0017 => { // Record Framerate (actual sensor capture rate)
                     if let Some(fps) = as_rational() {
-                        if self.record_framerate.is_none() {
-                            self.record_framerate = Some(fps);
+                        self.record_frame_rate = Some(fps);
+                        if self.playback_frame_rate.is_none() {
+                            self.playback_frame_rate = Some(fps);
                             util::insert_tag(map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:.3}", v), fps, vec![]), options);
                         }
-                        md.insert("record_framerate".into(), fps.into());
+                        md.insert("record_frame_rate".into(), fps.into());
                     }
                 }
                 0x0000_0001 => { md.insert("make".into(), as_string().into()); }
@@ -279,7 +303,34 @@ impl Nikon {
                 // Nikon MakerNotes (0x0200xxxx prefix)
                 0x0200_0005 => { md.insert("white_balance_setting".into(), as_string().trim().into()); }
                 0x0200_0007 => { md.insert("focus_mode".into(), as_string().trim().into()); }
-                0x0200_001B => { if let Some(v) = as_u32() { md.insert("nikon_0x1b".into(), v.into()); } }
+                0x0200_001B => {
+                    // CropHiSpeed: 7 × u16 [crop_type, full_w, full_h, crop_w, crop_h, x_off, y_off]
+                    if type_id == 3 && count >= 7 && value_bytes.len() >= 14 {
+                        let mut rdr = Cursor::new(&value_bytes);
+                        let crop_type = rdr.read_u16::<BigEndian>().unwrap_or(0);
+                        let full_w    = rdr.read_u16::<BigEndian>().unwrap_or(0);
+                        let full_h    = rdr.read_u16::<BigEndian>().unwrap_or(0);
+                        let crop_w    = rdr.read_u16::<BigEndian>().unwrap_or(0);
+                        let crop_h    = rdr.read_u16::<BigEndian>().unwrap_or(0);
+                        let _x_offset = rdr.read_u16::<BigEndian>().unwrap_or(0);
+                        let _y_offset = rdr.read_u16::<BigEndian>().unwrap_or(0);
+                        md.insert("crop_hi_speed_type".into(), crop_type.into());
+                        md.insert("crop_hi_speed_full_w".into(), full_w.into());
+                        md.insert("crop_hi_speed_full_h".into(), full_h.into());
+                        md.insert("crop_hi_speed_crop_w".into(), crop_w.into());
+                        md.insert("crop_hi_speed_crop_h".into(), crop_h.into());
+                        md.insert("nikon_0x1b".into(), crop_type.into());
+                    } else if let Some(v) = as_u32() {
+                        md.insert("nikon_0x1b".into(), v.into());
+                    }
+                }
+                0x0200_001F => { // VRInfo binary block
+                    // byte[4] = VibrationReduction: 0=n/a, 1=On, 2=Off
+                    if value_bytes.len() >= 5 {
+                        self.vibration_reduction = Some(value_bytes[4]);
+                        md.insert("vibration_reduction".into(), (value_bytes[4] as u32).into());
+                    }
+                }
                 0x0200_002A => { if let Some(v) = as_u32() { md.insert("nikon_0x2a".into(), v.into()); } }
                 0x0200_003C => { if let Some(v) = as_u32() { md.insert("nikon_0x3c".into(), v.into()); } }
                 0x0200_003F => { if let Some(val) = as_rational() { md.insert("exposure_fine_tune".into(), val.into()); } } // Possibly exposure fine tuning
@@ -291,7 +342,7 @@ impl Nikon {
                 0x0000_1000 => { // StartEdgeCode
                     if type_id == 2 {
                         md.insert("start_edge_timecode".into(), as_string().into());
-                    } else if let (Some(fr), Some(fps)) = (as_u32(), self.record_framerate) {
+                    } else if let (Some(fr), Some(fps)) = (as_u32(), self.record_frame_rate) {
                         md.insert("start_edge_timecode".into(), frames_to_timecode(fr, fps).into());
                     } else if let Some(fr) = as_u32() {
                         md.insert("start_edge_timecode_frames".into(), fr.into());
@@ -300,7 +351,7 @@ impl Nikon {
                 0x0000_1001 => { // StartTimecode
                     if type_id == 2 {
                         md.insert("start_absolute_timecode".into(), as_string().into());
-                    } else if let (Some(fr), Some(fps)) = (as_u32(), self.record_framerate) {
+                    } else if let (Some(fr), Some(fps)) = (as_u32(), self.record_frame_rate) {
                         md.insert("start_absolute_timecode".into(), frames_to_timecode(fr, fps).into());
                     } else if let Some(fr) = as_u32() {
                         md.insert("start_absolute_timecode_frames".into(), fr.into());
@@ -325,6 +376,12 @@ impl Nikon {
                 0x0000_403b => { if let Some(v) = as_u32() { md.insert("iso".into(), v.into()); } }
                 0x0000_406a => { if let Some(v) = as_f64() { md.insert("f_number".into(), v.into()); } }
                 0x0000_406b => { if let Some(v) = as_f64() { md.insert("lens_focal_length".into(), v.into()); } }
+                0x0000_1013 => { // ElectronicVR: 0=Off, 1=On
+                    if let Some(v) = as_u32() {
+                        self.electronic_vr = Some(v);
+                        md.insert("electronic_vr".into(), v.into());
+                    }
+                }
                 _ => {
                     let key = format!("tag_0x{:08x}", tag_id);
                     match type_id {
@@ -357,20 +414,31 @@ impl Nikon {
         let mut cursor = Cursor::new(data);
         let len = data.len() as u64;
 
-        // Scan for NRMT atoms
-        while cursor.position() + 12 <= len {
+        // Parse NRAW atom tree. Structure:
+        //   NRAW (container) > NRFM, NRFH (container) > NRHM, NRMT×N, NRTH, ...
+        // NRMT atoms contain per-frame metadata. After NRFH ends, the rest is RAW pixel data.
+        // Use atom sizes to skip efficiently — never scan byte-by-byte.
+        while cursor.position() + 8 <= len {
             let atom_start = cursor.position();
-
             let atom_size = cursor.read_u32::<BigEndian>()? as u64;
 
-            // Validate size
-            if atom_size < 12 || atom_start + atom_size > len {
-                cursor.set_position(atom_start + 1);
-                continue;
+            if atom_size < 8 {
+                break;
             }
 
             let mut magic = [0u8; 4];
             cursor.read_exact(&mut magic)?;
+
+            // Container atoms (NRAW, NRFH): enter regardless of declared size
+            // (data may be truncated via max_sample_size, but children are at the start)
+            if &magic == b"NRAW" || &magic == b"NRFH" {
+                continue;
+            }
+
+            // Non-container atoms: need full data within buffer
+            if atom_start + atom_size > len {
+                break;
+            }
 
             if &magic == b"NRMT" && atom_size >= 13 {
                 // NRMT structure: [size:4]["NRMT":4][tag_id:4][pad:1][value:N]
@@ -459,22 +527,9 @@ impl Nikon {
                         }
                     }
                 }
-            } else if &magic == b"NRAW" || &magic == b"NRFM" || &magic == b"NRFH" || &magic == b"NRHM" || &magic == b"NRTH" {
-                // Container atoms - parse contents (don't skip, just continue from current position)
-            } else if &magic == b"NRTI" {
-                // Thumbnail atom - skip entire atom
-                let mut _unknown = [0u8; 4];
-                cursor.read_exact(&mut _unknown)?;
-                let thumb_size = cursor.read_u32::<BigEndian>()? as u64;
-                cursor.set_position(atom_start + thumb_size + 8);
             } else {
-                // Unknown atom with valid size - skip it
-                if atom_size >= 8 {
-                    cursor.set_position(atom_start + atom_size);
-                } else {
-                    // Invalid size - advance by 1 byte and try again
-                    cursor.set_position(atom_start + 1);
-                }
+                // Non-container atoms (NRFM, NRHM, NRTH, NRTI, etc.) — skip by size
+                cursor.set_position(atom_start + atom_size);
             }
         }
 
@@ -503,5 +558,215 @@ impl Nikon {
         }
 
         Ok(())
+    }
+
+    /// Normalize a datetime string to "yyyy:MM:dd HH:mm:ss" format.
+    /// Handles formats like "2024:07:23 21:41:48", "2024-07-23T21:41:48", "2024-07-23 21:41:48", etc.
+    fn normalize_datetime(s: &str) -> Option<String> {
+        let s = s.trim();
+        if s.is_empty() { return None; }
+        // Already in "yyyy:MM:dd HH:mm:ss" format
+        if s.len() >= 19 && s.chars().nth(4) == Some(':') && s.chars().nth(7) == Some(':') && s.chars().nth(13) == Some(':') && s.chars().nth(16) == Some(':') {
+            return Some(s[..19].to_string());
+        }
+        // Try "yyyy-MM-ddTHH:mm:ss" or "yyyy-MM-dd HH:mm:ss"
+        if s.len() >= 19 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-') {
+            let date_part = &s[..10]; // yyyy-MM-dd
+            let time_part = &s[11..19]; // HH:mm:ss
+            let formatted_date = date_part.replace('-', ":");
+            return Some(format!("{} {}", formatted_date, time_part));
+        }
+        None
+    }
+
+    /// Compose datetime from "YYYYMMDD" date and "HHMMSS" time strings.
+    fn compose_datetime(date: &str, time: &str) -> Option<String> {
+        let date = date.trim();
+        let time = time.trim();
+        if date.len() < 8 || time.len() < 6 { return None; }
+        let year = &date[0..4];
+        let month = &date[4..6];
+        let day = &date[6..8];
+        let hour = &time[0..2];
+        let min = &time[2..4];
+        let sec = &time[4..6];
+        Some(format!("{}:{}:{} {}:{}:{}", year, month, day, hour, min, sec))
+    }
+
+    fn process_map(&mut self, samples: &mut Vec<SampleInfo>, options: &crate::InputOptions, video_md: Option<&VideoMetadata>) {
+        // Extract metadata JSON fields from first sample
+        let md_json: Option<serde_json::Value> = samples.first()
+            .and_then(|s| s.tag_map.as_ref())
+            .and_then(|m| m.get(&GroupId::Default))
+            .and_then(|m| m.get(&TagId::Metadata))
+            .and_then(|t| {
+                if let TagValue::Json(ref v) = t.value { Some(v.get().clone()) } else { None }
+            });
+
+        let md = match md_json.as_ref().and_then(|v| v.as_object()) {
+            Some(m) => m,
+            None => return,
+        };
+
+        let raw_model = md.get("camera_model").and_then(|v| v.as_str()).unwrap_or("");
+        let resolution_w = video_md.map(|v| v.width as u32).unwrap_or(0);
+        let resolution_h = video_md.map(|v| v.height as u32).unwrap_or(0);
+        let fps = video_md.map(|v| v.fps).unwrap_or(0.0);
+
+        // Write video track resolution
+        if let Some(vmd) = video_md {
+            if let Some(ref mut map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
+                util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("video_width".into()), "Video output width", u32, |v| format!("{} px", v), vmd.width as u32, Vec::new()), options);
+                util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("video_height".into()), "Video output height", u32, |v| format!("{} px", v), vmd.height as u32, Vec::new()), options);
+            }
+        }
+
+        // CropHiSpeed scale: full_w / crop_w
+        let scale_35mm = md.get("crop_hi_speed_full_w").and_then(|v| v.as_f64())
+            .and_then(|full_w| {
+                md.get("crop_hi_speed_crop_w").and_then(|v| v.as_f64()).and_then(|crop_w| {
+                    if crop_w > 0.0 && full_w > 0.0 { Some(full_w / crop_w) } else { None }
+                })
+            });
+
+        // Lens and focal length
+        let lens_name = md.get("lens_name").and_then(|v| v.as_str()).unwrap_or("");
+        let _focal_length = if !lens_name.is_empty() {
+            md.get("lens_focal_length").and_then(|v| v.as_f64())
+        } else {
+            None
+        };
+
+        // Extract creation date from NCDT metadata
+        let creation_date: Option<String> = md.get("local_datetime")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Self::normalize_datetime(s))
+            .or_else(|| {
+                // Fallback: compose from local_date + local_time
+                let date = md.get("local_date").and_then(|v| v.as_str())?;
+                let time = md.get("local_time").and_then(|v| v.as_str())?;
+                Self::compose_datetime(date, time)
+            });
+        let timezone: Option<String> = md.get("timezone").and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        // Try JSON database first
+        if let Some(db_path) = &options.camera_db_path {
+            if let Ok(db) = crate::camera_db::CameraDatabase::load(db_path) {
+                // First pass: extract model info, crop, sensor_width from first sample
+                let db_result: Option<(String, f32, Option<f64>, Option<f64>)> = {
+                    if let Some(ref mut map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
+                        if let Some((model_name, model_data)) = db.process_model("NIKON", raw_model, map, options) {
+                            self.model = Some(model_name.to_string());
+                            let sensor_w = model_data.sw;
+
+                            // Determine crop factor
+                            let crop_factor = if let Some(scale) = scale_35mm {
+                                Some(scale)
+                            } else {
+                                let crop_type = md.get("crop_hi_speed_type").and_then(|v| v.as_u64()).map(|v| v as u16);
+                                let view_angle = crop_type.and_then(|ct| db.lookup_crop_type("NIKON", ct))
+                                    .unwrap_or(if sensor_w > 30.0 { "FX" } else { "DX" });
+
+                                let tags = std::collections::HashMap::new();
+                                db.match_crop("NIKON", model_name, resolution_w, resolution_h, fps, Some(view_angle), &tags)
+                            };
+
+                            let effective_crop = crop_factor.unwrap_or(1.0);
+                            let unit_px_fl = if resolution_w > 0 && sensor_w > 0.0 {
+                                Some(resolution_w as f64 * effective_crop / sensor_w as f64)
+                            } else {
+                                None
+                            };
+
+                            // Readout (only on first sample)
+                            if self.frame_readout_time.is_none() {
+                                let tags = std::collections::HashMap::new();
+                                if let Some(rt) = db.process_readout("NIKON", model_name, resolution_w, resolution_h, fps, scale_35mm.unwrap_or(1.0), sensor_w, &tags, map, options) {
+                                    self.frame_readout_time = Some(rt);
+                                }
+                            }
+
+                            Some((model_name.to_string(), sensor_w, crop_factor, unit_px_fl))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }; // first-sample borrow released here
+
+                if let Some((_model_name, _sensor_w, crop_factor, unit_px_fl)) = db_result {
+                    // Second pass: write crop_factor, unit_pixel_focal_length, and PixelFocalLength to ALL samples
+                    for sample in samples.iter_mut() {
+                        if let Some(ref mut smap) = sample.tag_map {
+                            // Write crop_factor (same for all frames)
+                            if !smap.get(&GroupId::Default).map_or(false, |m| m.contains_key(&TagId::Custom("crop_factor".into()))) {
+                                if let Some(cf) = crop_factor {
+                                    util::insert_tag(smap, tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{:.4}", v), cf, Vec::new()), options);
+                                }
+                            }
+
+                            // Write unit_pixel_focal_length (same for all frames)
+                            if let Some(upfl) = unit_px_fl {
+                                if !smap.get(&GroupId::Lens).map_or(false, |m| m.contains_key(&TagId::Custom("unit_pixel_focal_length".into()))) {
+                                    util::insert_tag(smap, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), upfl, Vec::new()), options);
+                                }
+                            }
+
+                            // Write PixelFocalLength based on THIS frame's FocalLength or user-provided focal length
+                            if let Some(upfl) = unit_px_fl {
+                                let fl_from_file = smap.get(&GroupId::Lens)
+                                    .and_then(|m| m.get_t(TagId::FocalLength) as Option<&f32>)
+                                    .map(|v| *v as f64);
+                                let fl = fl_from_file.or(options.user_focal_length);
+                                if let Some(fl) = fl {
+                                    if fl > 0.0 {
+                                        let px_fl = (fl * upfl) as f32;
+                                        util::insert_tag(smap, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{:.2}", v), px_fl, Vec::new()), options);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Write to first sample: creation date, slow-motion, stabilization
+                    if let Some(ref mut map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
+                        if let Some(ref date_str) = creation_date {
+                            util::write_creation_date_tags(map, date_str, timezone.as_deref(), Some("500"), options);
+                        } else if let Some(ref mvhd_time) = self.mvhd_creation_time {
+                            util::write_creation_date_tags(map, mvhd_time, None, Some("500"), options);
+                        }
+
+                        // Frame rates: always output RecordFrameRate (FrameRate already set from NCTG 0x16)
+                        if let Some(record_fps) = self.record_frame_rate {
+                            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::RecordFrameRate, "Record frame rate", f64, |v| format!("{:.3} fps", v), record_fps, Vec::new()), options);
+                        }
+
+                        // Image stabilization: ElectronicVR OR VibrationReduction
+                        let evr_on = if self.is_r3d {
+                            false // R3D files: skip ElectronicVR
+                        } else {
+                            self.electronic_vr == Some(1)
+                        };
+                        let vr_on = self.vibration_reduction == Some(1); // 0=n/a, 1=On, 2=Off
+                        let is_stabilized = evr_on || vr_on;
+                        util::insert_tag(map, tag!(parsed GroupId::Default, TagId::ImageStabilizer, "Image stabilization", bool, |v| if *v { "On" } else { "Off" }.into(), is_stabilized, Vec::new()), options);
+                    }
+
+                    return; // JSON path complete
+                }
+            }
+        }
+
+        // Fallback creation date (no JSON db match)
+        if let Some(ref mut map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
+            if let Some(ref date_str) = creation_date {
+                util::write_creation_date_tags(map, date_str, timezone.as_deref(), Some("500"), options);
+            } else if let Some(ref mvhd_time) = self.mvhd_creation_time {
+                util::write_creation_date_tags(map, mvhd_time, None, Some("500"), options);
+            }
+        }
     }
 }

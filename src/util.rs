@@ -82,6 +82,144 @@ pub fn patch_mdhd_timescale(all: &mut [u8]) {
     }
 }
 
+/// Extract creation_time from MP4 mvhd atom in a buffer.
+/// Returns formatted string "yyyy:MM:dd HH:mm:ss" in UTC.
+/// mvhd stores seconds since 1904-01-01 00:00:00 UTC.
+pub fn extract_mvhd_creation_time(buffer: &[u8]) -> Option<String> {
+    let pos = memmem::find(buffer, b"mvhd")?;
+    if buffer.len() < pos + 20 { return None; }
+    let version = buffer[pos + 4];
+    let ct = match version {
+        1 => {
+            if buffer.len() < pos + 20 { return None; }
+            (&buffer[pos + 8..]).read_u64::<BigEndian>().ok()?
+        }
+        _ => {
+            if buffer.len() < pos + 12 { return None; }
+            (&buffer[pos + 8..]).read_u32::<BigEndian>().ok()? as u64
+        }
+    };
+    if ct == 0 { return None; }
+    // Convert from seconds since 1904-01-01 to Unix timestamp
+    // Difference: 1904-01-01 to 1970-01-01 = 2082844800 seconds
+    let unix_ts = ct as i64 - 2082844800;
+    let dt = chrono::TimeZone::timestamp_opt(&chrono::Utc, unix_ts, 0).single()?;
+    Some(dt.format("%Y:%m:%d %H:%M:%S").to_string())
+}
+
+/// Write unified creation date tags to a tag_map.
+/// `date_str`: local time in "yyyy:MM:dd HH:mm:ss" format (or UTC if no timezone).
+/// `tz_str`: timezone offset like "+08:00" or "-05:00", None if unknown.
+/// `subsec`: sub-second string like "875" (ms) or "83" (centisecond), None to omit.
+/// When `tz_str` is None, `date_str` is treated as UTC.
+pub fn write_creation_date_tags(tag_map: &mut GroupedTagMap, date_str: &str, tz_str: Option<&str>, subsec: Option<&str>, options: &crate::InputOptions) {
+    fn make_string_tag(group: GroupId, id: TagId, desc: &str, val: String) -> TagDescription {
+        TagDescription { group, id, description: desc.to_owned(), value: TagValue::String(ValueType::new_parsed(|v| v.clone(), val, Vec::new())), native_id: None }
+    }
+
+    let full_date = if let Some(ss) = subsec {
+        format!("{}.{}", date_str, ss)
+    } else {
+        date_str.to_string()
+    };
+
+    // Write CreationDate (local time or UTC)
+    insert_tag(tag_map, make_string_tag(GroupId::Default, TagId::CreationDate, "Creation date", full_date.clone()), options);
+
+    if let Some(tz) = tz_str {
+        // Write TimeZoneOffset
+        insert_tag(tag_map, make_string_tag(GroupId::Default, TagId::TimeZoneOffset, "Time zone offset", tz.to_string()), options);
+
+        // Calculate UTC: parse local time as UTC epoch, subtract timezone offset
+        let utc_str = calculate_utc_from_local(&full_date, tz).unwrap_or_else(|| full_date.clone());
+        insert_tag(tag_map, make_string_tag(GroupId::Default, TagId::CreationDateUtc, "Creation date (UTC)", utc_str), options);
+    } else {
+        // No timezone: CreationDateUtc = CreationDate (default UTC interpretation)
+        insert_tag(tag_map, make_string_tag(GroupId::Default, TagId::CreationDateUtc, "Creation date (UTC)", full_date), options);
+    }
+}
+
+/// Calculate UTC time string from local time string and timezone offset.
+/// local_str: "yyyy:MM:dd HH:mm:ss" or "yyyy:MM:dd HH:mm:ss.SSS", tz_str: "+HH:MM" or "-HH:MM"
+fn calculate_utc_from_local(local_str: &str, tz_str: &str) -> Option<String> {
+    // Split off subsecond part if present
+    let (base_str, subsec) = if let Some(dot_pos) = local_str.rfind('.') {
+        (&local_str[..dot_pos], Some(&local_str[dot_pos..]))
+    } else {
+        (local_str, None)
+    };
+
+    // Parse timezone offset to seconds
+    let tz_str = tz_str.trim();
+    let (sign, rest) = if tz_str.starts_with('-') {
+        (-1i64, &tz_str[1..])
+    } else if tz_str.starts_with('+') {
+        (1i64, &tz_str[1..])
+    } else {
+        (1i64, tz_str)
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() != 2 { return None; }
+    let hours: i64 = parts[0].parse().ok()?;
+    let minutes: i64 = parts[1].parse().ok()?;
+    let offset_seconds = sign * (hours * 3600 + minutes * 60);
+
+    // Parse local time as naive datetime
+    let naive = chrono::NaiveDateTime::parse_from_str(base_str, "%Y:%m:%d %H:%M:%S").ok()?;
+    // Interpret as UTC epoch, then subtract offset
+    let local_epoch = naive.and_utc().timestamp();
+    let utc_epoch = local_epoch - offset_seconds;
+
+    let utc_dt = chrono::TimeZone::timestamp_opt(&chrono::Utc, utc_epoch, 0).single()?;
+    let mut result = utc_dt.format("%Y:%m:%d %H:%M:%S").to_string();
+    // Preserve subsecond part (not affected by timezone offset)
+    if let Some(ss) = subsec {
+        result.push_str(ss);
+    }
+    Some(result)
+}
+
+/// Convert UTC time string to local time string using timezone offset.
+/// utc_str: "yyyy:MM:dd HH:mm:ss", tz_str: "+HH:MM" or "-HH:MM"
+pub fn calculate_local_from_utc(utc_str: &str, tz_str: &str) -> Option<String> {
+    let tz_str = tz_str.trim();
+    let (sign, rest) = if tz_str.starts_with('-') {
+        (-1i64, &tz_str[1..])
+    } else if tz_str.starts_with('+') {
+        (1i64, &tz_str[1..])
+    } else {
+        (1i64, tz_str)
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() != 2 { return None; }
+    let hours: i64 = parts[0].parse().ok()?;
+    let minutes: i64 = parts[1].parse().ok()?;
+    let offset_seconds = sign * (hours * 3600 + minutes * 60);
+
+    let naive = chrono::NaiveDateTime::parse_from_str(utc_str, "%Y:%m:%d %H:%M:%S").ok()?;
+    let utc_epoch = naive.and_utc().timestamp();
+    let local_epoch = utc_epoch + offset_seconds;
+
+    let local_dt = chrono::TimeZone::timestamp_opt(&chrono::Utc, local_epoch, 0).single()?;
+    Some(local_dt.format("%Y:%m:%d %H:%M:%S").to_string())
+}
+
+/// Infer timezone offset from local time string and UTC time string.
+/// Returns "+HH:MM" or "-HH:MM", rounded to nearest 15 minutes.
+pub fn infer_timezone(local_str: &str, utc_str: &str) -> Option<String> {
+    let local = chrono::NaiveDateTime::parse_from_str(local_str, "%Y:%m:%d %H:%M:%S").ok()?;
+    let utc = chrono::NaiveDateTime::parse_from_str(utc_str, "%Y:%m:%d %H:%M:%S").ok()?;
+    let diff_secs = local.and_utc().timestamp() - utc.and_utc().timestamp();
+    // Round to nearest 15 minutes to handle small second-level discrepancies
+    let rounded = ((diff_secs as f64 / 900.0).round() as i64) * 900;
+    if rounded == 0 { return Some("+00:00".to_string()); }
+    let sign = if rounded >= 0 { "+" } else { "-" };
+    let abs = rounded.unsigned_abs();
+    let hours = abs / 3600;
+    let minutes = (abs % 3600) / 60;
+    Some(format!("{}{:02}:{:02}", sign, hours, minutes))
+}
+
 pub struct PatchingLimitingStream<R: Read + Seek> {
     pub inner: R,
     pub stream_size: usize,
@@ -745,7 +883,7 @@ pub fn get_video_metadata<T: Read + Seek>(stream: &mut T, filesize: usize) -> Re
 
     if header == [0x06, 0x0E, 0x2B, 0x34] { // MXF header
         let mut md = VideoMetadata::default();
-        crate::sony::mxf::parse(stream, filesize, |_|(), Arc::new(AtomicBool::new(false)), Some(&mut md), &crate::InputOptions::default(), crate::sony::Sony::parse_metadata)?;
+        let (_samples, _creation_time, _creation_subsec) = crate::sony::mxf::parse(stream, filesize, |_|(), Arc::new(AtomicBool::new(false)), Some(&mut md), &crate::InputOptions::default(), crate::sony::Sony::parse_metadata)?;
         return Ok(md);
     }
 
@@ -830,6 +968,37 @@ pub fn find_gcsv_sidecar_for_image_sequence(path: &str, ext: Option<&str>) -> Op
         }
     }
     None
+}
+
+/// Preprocess a string for fuzzy matching: lowercase and remove spaces.
+fn preprocess_for_match(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+/// Find the longest matching model name from a list using substring containment.
+/// The target string (e.g. "Canon EOS R6 Mark III") is checked to see if it contains
+/// each candidate (e.g. "R6 Mark III"), after preprocessing (lowercase, no spaces).
+/// Returns the original (unprocessed) candidate with the longest preprocessed match.
+pub fn find_longest_substring<'a>(target: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let preprocessed_target = preprocess_for_match(target);
+    let mut best: Option<&'a str> = None;
+    let mut best_len = 0;
+
+    for &candidate in candidates {
+        let preprocessed = preprocess_for_match(candidate);
+        if preprocessed_target.contains(&preprocessed) && preprocessed.len() > best_len {
+            best = Some(candidate);
+            best_len = preprocessed.len();
+        }
+    }
+
+    best
+}
+
+/// Calculate pixel focal length from physical focal length, sensor width, resolution, and crop factor.
+/// Formula: fx = focal_length / sensor_width * resolution_w * crop
+pub fn calc_pixel_focal_length(focal_length: f64, sensor_width: f32, resolution_w: u32, crop: f64) -> f64 {
+    focal_length / sensor_width as f64 * resolution_w as f64 * crop
 }
 
 #[macro_export]
