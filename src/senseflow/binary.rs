@@ -5,14 +5,8 @@ use crate::*;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use std::io::*;
 
-pub fn parse<T: Read + Seek>(stream: &mut T, _size: usize, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
+pub fn parse<T: Read + Seek>(stream: &mut T, size: usize, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
     let mut stream = std::io::BufReader::new(stream);
-
-    let mut gyro = Vec::new();
-    let mut accl = Vec::new();
-    let mut angl = Vec::new();
-    let mut magn = Vec::new();
-    let mut quat = Vec::new();
 
     let mut last_timestamp;
 
@@ -41,7 +35,7 @@ pub fn parse<T: Read + Seek>(stream: &mut T, _size: usize, options: crate::Input
     let first_timestamp = 0f64;
 
     d.seek(SeekFrom::Start(76))?;
-    let _init_quat = TimeQuaternion {
+    let init_quat = TimeQuaternion {
         t: (first_timestamp * 1000.0) as f64,
         v: Quaternion {
             w: d.read_f32::<LittleEndian>()? as f64,
@@ -69,7 +63,185 @@ pub fn parse<T: Read + Seek>(stream: &mut T, _size: usize, options: crate::Input
     let magn_range = (d.read_u32::<LittleEndian>()? as f64) / 1000.0;
 
     let timestamp_step = 1.0f64 / (log_freq as f64);
-    last_timestamp = first_timestamp - timestamp_step;
+
+    // Read timezone offset from header (i16 minutes at buf[70..72])
+    let tz_offset_min = i16::from_le_bytes([buf[70], buf[71]]);
+    let tz_sign = if tz_offset_min >= 0 { "+" } else { "-" };
+    let tz_abs = tz_offset_min.unsigned_abs();
+    let tz_str = format!("{}{:02}:{:02}", tz_sign, tz_abs / 60, tz_abs % 60);
+    let date_str = created_at.format("%Y:%m:%d %H:%M:%S").to_string();
+
+    // ── header_only mode: return metadata without parsing any IMU frames ──
+    if options.header_only {
+        let duration_ms = if size > 512 { (size - 512) as f64 / 16.0 } else { 0.0 };
+        let metadata = serde_json::json!({
+            "brand": brand,
+            "version": version,
+            "created_at": created_at.to_string(),
+            "log_freq": log_freq,
+            "accl_odr": accl_odr,
+            "accl_max_bandwidth": accl_max_bw,
+            "accl_timeoffset": accl_timeoffset,
+            "accl_range": accl_range,
+            "gyro_odr": gyro_odr,
+            "gyro_max_bandwidth": gyro_max_bw,
+            "gyro_timeoffset": gyro_timeoffset,
+            "gyro_range": gyro_range,
+            "magn_odr": magn_odr,
+            "magn_max_bandwidth": magn_max_bw,
+            "magn_timeoffset": magn_timeoffset,
+            "magn_range": magn_range,
+            "timestamp_step": timestamp_step,
+            "init quart": init_quat,
+            "lens_index": serde_json::Value::Null,
+            "focus_length": serde_json::Value::Null,
+        });
+
+        let mut map = GroupedTagMap::new();
+        util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::Metadata, "Metadata", Json, |v| serde_json::to_string(v).unwrap(), metadata, vec![]), &options);
+        util::write_creation_date_tags(&mut map, &date_str, Some(&tz_str), None, &options);
+
+        return Ok(vec![SampleInfo {
+            timestamp_ms: first_timestamp as f64,
+            duration_ms,
+            tag_map: Some(map),
+            ..Default::default()
+        }]);
+    }
+
+    // ── Determine seek range for time_range_ms mode ──
+    let bytes_per_ms = 16.0f64;
+    let (seek_start, imu_start_ms, end_pos) = if let Some((start_ms, end_ms)) = options.time_range_ms {
+        // Seek 1 second earlier to scan for lens frames
+        let lens_scan_start_ms = (start_ms - 1000.0).max(0.0);
+        let seek_pos = 512u64 + ((lens_scan_start_ms * bytes_per_ms) as u64 / 16) * 16;
+        let end = 512u64 + (end_ms * bytes_per_ms) as u64;
+        (Some(seek_pos), Some(start_ms), Some(end))
+    } else {
+        (None, None, None)
+    };
+
+    if let Some(pos) = seek_start {
+        stream.seek(SeekFrom::Start(pos))?;
+        // Set timestamp based on seek position
+        let seeked_ms = (pos - 512) as f64 / bytes_per_ms;
+        last_timestamp = seeked_ms / 1000.0 - timestamp_step;
+    } else {
+        last_timestamp = first_timestamp - timestamp_step;
+    }
+
+    let mut gyro = Vec::new();
+    let mut accl = Vec::new();
+    let mut angl = Vec::new();
+    let mut magn = Vec::new();
+    let mut quat = Vec::new();
+
+    let mut first_lens: Option<(u8, u16)> = None;
+
+    // acc gyro mag quad angle temp -- --
+    let sensor_length = [6, 6, 6, 8, 12, 2, 0, 0];
+    let mut sensor_valid = [0u8; 8];
+
+    while let Ok(tag) = stream.read_u16::<BigEndian>() {
+        // Check end position for time_range mode
+        if let Some(ep) = end_pos {
+            let pos = stream.stream_position().unwrap_or(0);
+            if pos > ep { break; }
+        }
+
+        if tag == 0xaa55 {
+            let mut data_valid = stream.read_u8()?;
+            let mut data_length = 0;
+            for n in 0..8 {
+                sensor_valid[n] = data_valid & 0b00000001;
+                if sensor_valid[n] == 1 {
+                    data_length += sensor_length[n];
+                }
+                data_valid >>= 1;
+            }
+
+            if let Ok(mut d) = checksum(&mut stream, data_length) {
+                last_timestamp += timestamp_step;
+
+                // In time_range mode, only collect IMU data from imu_start_ms onwards
+                let collect_imu = match imu_start_ms {
+                    Some(start) => (last_timestamp * 1000.0) >= start,
+                    None => true,
+                };
+
+                if collect_imu {
+                    if sensor_valid[0] == 1 {
+                        accl.push(TimeVector3 {
+                            t: (last_timestamp as f64) + (accl_timeoffset as f64) / 1000.0,
+                            x: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * accl_range,
+                            y: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * accl_range,
+                            z: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * accl_range,
+                        });
+                    }
+
+                    if sensor_valid[1] == 1 {
+                        gyro.push(TimeVector3 {
+                            t: (last_timestamp as f64) + (gyro_timeoffset as f64) / 1000.0,
+                            x: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * gyro_range,
+                            y: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * gyro_range,
+                            z: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * gyro_range,
+                        });
+                    }
+
+                    if sensor_valid[2] == 1 {
+                        magn.push(TimeVector3 {
+                            t: (last_timestamp as f64) + (magn_timeoffset as f64) / 1000.0,
+                            x: d.read_i16::<LittleEndian>()? as i64,
+                            y: d.read_i16::<LittleEndian>()? as i64,
+                            z: d.read_i16::<LittleEndian>()? as i64,
+                        });
+                    }
+
+                    if sensor_valid[3] == 1 {
+                        quat.push(TimeQuaternion {
+                            t: (last_timestamp * 1000.0) as f64,
+                            v: util::multiply_quats(
+                                (
+                                    (d.read_i16::<LittleEndian>()? as f64) / 32768.0,
+                                    (d.read_i16::<LittleEndian>()? as f64) / 32768.0,
+                                    (d.read_i16::<LittleEndian>()? as f64) / 32768.0,
+                                    (d.read_i16::<LittleEndian>()? as f64) / 32768.0,
+                                ),
+                                ((2.0_f64).sqrt() * 0.5, 0.0, 0.0, -(2.0_f64).sqrt() * 0.5),
+                            ),
+                        });
+                    }
+
+                    if sensor_valid[4] == 1 {
+                        angl.push(TimeVector3 {
+                            t: last_timestamp as f64,
+                            x: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * 180.0, // Roll
+                            y: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * 180.0, // Pitch
+                            z: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * 180.0, // Yaw
+                        });
+                    }
+                } else {
+                    // Before imu_start: still advance cursor past sensor data (already consumed by checksum)
+                    // but don't store. Also skip reading individual fields since checksum already consumed the data.
+                }
+            }
+        } else if tag == 0x55aa {
+            // Lens data frame (reversed magic, 1Hz in mix files)
+            // Total frame = 16 bytes: 2 (magic) + 1 (data_valid) + 11 (payload) + 1 (checksum) + 1 (padding)
+            // Read remaining 14 bytes of the 16-byte frame
+            let mut lens_buf = [0u8; 14];
+            if stream.read_exact(&mut lens_buf).is_ok() {
+                if lens_buf[0] == 0b01000000 && first_lens.is_none() {
+                    let lens_index = lens_buf[10];          // byte[12] of frame
+                    let foc_hi = lens_buf[11] as u16;       // byte[13] of frame
+                    let foc_lo = lens_buf[12] as u16;       // byte[14] of frame
+                    let focus_length = (foc_hi << 8) | foc_lo;
+                    first_lens = Some((lens_index, focus_length));
+                }
+                // Lens frame does not occupy an IMU time slot — do not advance timestamp
+            }
+        }
+    }
 
     let metadata = serde_json::json!({
        "brand": brand,
@@ -89,80 +261,10 @@ pub fn parse<T: Read + Seek>(stream: &mut T, _size: usize, options: crate::Input
        "magn_timeoffset": magn_timeoffset,
        "magn_range": magn_range,
        "timestamp_step": timestamp_step,
-       "init quat": _init_quat,
+       "init quart": init_quat,
+       "lens_index": first_lens.map(|(idx, _)| idx),
+       "focus_length": first_lens.map(|(_, fl)| fl),
     });
-
-    // acc gyro mag quad angle temp -- --
-    let sensor_length = [6, 6, 6, 8, 12, 2, 0, 0];
-    let mut sensor_valid = [0u8; 8];
-
-    while let Ok(tag) = stream.read_u16::<BigEndian>() {
-        if tag == 0xaa55 {
-            let mut data_valid = stream.read_u8()?;
-            let mut data_length = 0;
-            for n in 0..8 {
-                sensor_valid[n] = data_valid & 0b00000001;
-                if sensor_valid[n] == 1 {
-                    data_length += sensor_length[n];
-                }
-                data_valid >>= 1;
-            }
-
-            if let Ok(mut d) = checksum(&mut stream, data_length) {
-                last_timestamp += timestamp_step;
-                if sensor_valid[0] == 1 {
-                    accl.push(TimeVector3 {
-                        t: (last_timestamp as f64) + (accl_timeoffset as f64) / 1000.0,
-                        x: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * accl_range,
-                        y: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * accl_range,
-                        z: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * accl_range,
-                    });
-                }
-
-                if sensor_valid[1] == 1 {
-                    gyro.push(TimeVector3 {
-                        t: (last_timestamp as f64) + (gyro_timeoffset as f64) / 1000.0,
-                        x: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * gyro_range,
-                        y: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * gyro_range,
-                        z: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * gyro_range,
-                    });
-                }
-
-                if sensor_valid[2] == 1 {
-                    magn.push(TimeVector3 {
-                        t: (last_timestamp as f64) + (magn_timeoffset as f64) / 1000.0,
-                        x: d.read_i16::<LittleEndian>()? as i64,
-                        y: d.read_i16::<LittleEndian>()? as i64,
-                        z: d.read_i16::<LittleEndian>()? as i64,
-                    });
-                }
-
-                if sensor_valid[3] == 1 {
-                    quat.push(TimeQuaternion {
-                        t: (last_timestamp * 1000.0) as f64,
-                        v: util::multiply_quats(
-                            (
-                                (d.read_i16::<LittleEndian>()? as f64) / 32768.0,
-                                (d.read_i16::<LittleEndian>()? as f64) / 32768.0,
-                                (d.read_i16::<LittleEndian>()? as f64) / 32768.0,
-                                (d.read_i16::<LittleEndian>()? as f64) / 32768.0,
-                            ),
-                            ((2.0_f64).sqrt() * 0.5, 0.0, 0.0, -(2.0_f64).sqrt() * 0.5),
-                        ),
-                    });
-                }
-
-                if sensor_valid[4] == 1 {
-                    angl.push(TimeVector3 {
-                        t: last_timestamp as f64,
-                        x: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * 180.0, // Roll
-                        y: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * 180.0, // Pitch
-                        z: ((d.read_i16::<LittleEndian>()? as f64) / 32768.0) * 180.0, // Yaw
-                    });
-                }
-            }
-        }
-    }
 
     let mut map = GroupedTagMap::new();
 
@@ -183,6 +285,7 @@ pub fn parse<T: Read + Seek>(stream: &mut T, _size: usize, options: crate::Input
 
     util::insert_tag(&mut map, tag!(parsed GroupId::Quaternion,   TagId::Data, "Quaternion data",   Vec_TimeQuaternion_f64,  |v| format!("{:?}", v), quat, vec![]), &options);
     util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::Metadata, "Metadata", Json, |v| serde_json::to_string(v).unwrap(), metadata, vec![]), &options);
+    util::write_creation_date_tags(&mut map, &date_str, Some(&tz_str), None, &options);
 
     Ok(vec![SampleInfo {
         timestamp_ms: first_timestamp as f64,

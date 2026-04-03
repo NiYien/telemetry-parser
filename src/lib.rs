@@ -64,6 +64,10 @@ pub struct InputOptions {
     pub camera_db_path: Option<String>,
     /// User-provided focal length in mm (for manual lenses without electronic contacts)
     pub user_focal_length: Option<f64>,
+    /// SenseFlow: only parse 512-byte header, compute duration from filesize. No IMU data returned.
+    pub header_only: bool,
+    /// SenseFlow: time range in ms relative to file start. Parser seeks to computed byte offset.
+    pub time_range_ms: Option<(f64, f64)>,
 }
 
 macro_rules! impl_formats {
