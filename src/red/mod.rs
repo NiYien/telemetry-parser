@@ -13,6 +13,7 @@ use byteorder::{ ReadBytesExt, BigEndian };
 pub struct RedR3d {
     pub model: Option<String>,
     record_framerate: Option<f64>,
+    frame_readout_time: Option<f64>,
     all_parts: Vec<String>,
 }
 
@@ -31,7 +32,7 @@ impl RedR3d {
         vec!["r3d", "mp4", "mov", "mxf"]
     }
     pub fn frame_readout_time(&self) -> Option<f64> {
-        None
+        self.frame_readout_time
     }
     pub fn normalize_imu_orientation(v: String) -> String {
         v
@@ -46,13 +47,14 @@ impl RedR3d {
                 return Some(Self {
                     model: None,
                     record_framerate: None,
+                    frame_readout_time: None,
                     all_parts: Self::detect_all_parts(&p).unwrap_or_default()
                 })
             }
             if let Some(p) = filesystem::file_with_extension(&path, "") {
                 let all_parts = Self::detect_all_parts(&p).unwrap_or_default();
                 if all_parts.is_empty() { return None; }
-                return Some(Self { model: None, record_framerate: None, all_parts });
+                return Some(Self { model: None, record_framerate: None, frame_readout_time: None, all_parts });
             }
             return None;
         }
@@ -60,6 +62,7 @@ impl RedR3d {
             Some(Self {
                 model: None,
                 record_framerate: None,
+                frame_readout_time: None,
                 all_parts: Self::detect_all_parts(&path).unwrap_or_default()
             })
         } else {
@@ -384,6 +387,8 @@ impl RedR3d {
                     };
                     if let Ok(v) = v {
                         if id == "camera_model" { self.model = v.as_str().map(|x| x.to_string()); }
+                        // Older RED cameras (e.g. EPIC) store the model in camera_network_name (0x71) instead of camera_model (0xA0)
+                        if id == "camera_network_name" && self.model.is_none() { self.model = v.as_str().map(|x| x.to_string()); }
                         if id == "record_framerate" { self.record_framerate = v.as_f64(); }
 
                         items.push(v);
@@ -412,7 +417,8 @@ impl RedR3d {
                 util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::Name, "Lens name", String, |v| v.clone(), v.into(), vec![]), &options);
             }
 
-            let pixel_pitch = match self.model.as_deref() {
+            // Hardcoded pixel_pitch for known models (nanometers)
+            let mut pixel_pitch = match self.model.as_deref() {
                 Some("KOMODO 6K")       => Some((4400, 4400)),
                 Some("V-RAPTOR 8K VV")  => Some((5000, 5000)),
                 Some("V-RAPTOR 8K S35") => Some((3200, 3200)),
@@ -420,6 +426,54 @@ impl RedR3d {
                 Some("DSMC2 DRAGON-X 6K S35") => Some((5000, 5000)),
                 _ => None
             };
+
+            // Try camera_db for model lookup and pixel_pitch fallback
+            if let Some(raw_model) = self.model.clone() {
+                if let Some(db_path) = &options.camera_db_path {
+                    if let Ok(db) = crate::camera_db::CameraDatabase::load(db_path) {
+                        if let Some((model_name, model_data)) = db.process_model("RED", &raw_model, map, &options) {
+                            self.model = Some(model_name.to_string());
+
+                            // Compute pixel_pitch from sensor_width if not hardcoded
+                            if pixel_pitch.is_none() {
+                                let native_w = Self::native_sensor_width_from_model(model_name);
+                                if let Some(nw) = native_w {
+                                    let pp_nm = (model_data.sw as f64 * 1_000_000.0 / nw as f64).round() as u32;
+                                    if pp_nm > 0 {
+                                        pixel_pitch = Some((pp_nm, pp_nm));
+                                    }
+                                }
+                            }
+
+                            // unit_pixel_focal_length from sensor_width and native resolution
+                            let native_w = Self::native_sensor_width_from_model(model_name);
+                            let res_w = Self::extract_resolution_w(&md);
+                            if let Some(nw) = native_w {
+                                // effective_sensor_w = full_sensor_w * actual_res / native_res
+                                let effective_sw = if res_w > 0 && res_w < nw {
+                                    model_data.sw as f64 * res_w as f64 / nw as f64
+                                } else {
+                                    model_data.sw as f64
+                                };
+                                if effective_sw > 0.0 && res_w > 0 {
+                                    let unit_px_fl = res_w as f64 / effective_sw;
+                                    util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit_px_fl, vec![]), &options);
+                                }
+                            }
+
+                            // Readout time lookup
+                            if self.frame_readout_time.is_none() {
+                                let fps = self.record_framerate.unwrap_or(24.0);
+                                let tags = std::collections::HashMap::new();
+                                if let Some(rt) = db.process_readout("RED", model_name, res_w, 0, fps, 1.0, model_data.sw, &tags, map, &options) {
+                                    self.frame_readout_time = Some(rt);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if let Some(pp) = pixel_pitch {
                 util::insert_tag(map, tag!(parsed GroupId::Imager, TagId::PixelPitch, "Pixel pitch", u32x2, |v| format!("{v:?}"), pp, vec![]), &options);
             }
@@ -427,6 +481,37 @@ impl RedR3d {
             util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Metadata, "Metadata", Json, |v| serde_json::to_string(v).unwrap(), serde_json::Value::Object(md), vec![]), &options);
         }
         Ok(())
+    }
+
+    /// Extract native sensor width in pixels from model name.
+    /// RED models typically include resolution in their name (e.g., "8K", "6K", "5K", "4.5K").
+    fn native_sensor_width_from_model(model: &str) -> Option<u32> {
+        let model_upper = model.to_uppercase();
+        if model_upper.contains("8K")   { return Some(8192); }
+        if model_upper.contains("6K")   { return Some(6144); }
+        if model_upper.contains("5K")   { return Some(5120); }
+        if model_upper.contains("4.5K") { return Some(4608); }
+        if model_upper.contains("4K")   { return Some(4096); }
+        // Models without resolution suffix
+        match model_upper.as_str() {
+            "EPIC"    => Some(5120), // Mysterium-X 5K sensor
+            "SCARLET" => Some(4096), // Scarlet 4K sensor
+            _ => None
+        }
+    }
+
+    /// Extract resolution width from parsed metadata.
+    /// Tries `resolution_format_name` (e.g., "8K FF", "6K 2.4:1") for a rough resolution category.
+    fn extract_resolution_w(md: &serde_json::Map<String, serde_json::Value>) -> u32 {
+        if let Some(name) = md.get("resolution_format_name").and_then(|v| v.as_str()) {
+            let name_upper = name.to_uppercase();
+            if name_upper.starts_with("8K") { return 8192; }
+            if name_upper.starts_with("6K") { return 6144; }
+            if name_upper.starts_with("5K") { return 5120; }
+            if name_upper.starts_with("4K") { return 3840; }
+            if name_upper.starts_with("2K") || name_upper.starts_with("HD") { return 1920; }
+        }
+        0
     }
 
     fn parse_rmd(file: &str) -> HashMap<String, String> {

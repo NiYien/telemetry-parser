@@ -1,0 +1,25 @@
+{
+  "version": 1,
+
+  "models": {
+    "E2-F8":     { "sw": 36.0 },
+    "E2-F6 Pro": { "sw": 37.1 },
+    "E2-F6":     { "sw": 37.1 },
+    "E2-S6G":    { "sw": 23.4 },
+    "E2-S6":     { "sw": 23.4 },
+    "E2-M4":     { "sw": 19.0 },
+    "E2":        { "sw": 19.0 },
+    "E2C":       { "sw": 17.56 }
+  },
+
+  "readout": {
+    "columns": ["8K60","8K30","8K24","4K240","4K120","4K60","4K30","4K24","1K240","1K120","1K60","1K30","1K24"],
+    "data": {
+      "E2-F6":  [null, 20.1, 20.1, null, null, null, 13.4, 13.4, null, null, null, null, null],
+      "E2-S6G": [null, null, null, null, null, null, 11.1, 11.1, null, null, null, null, null],
+      "E2-M4":  [-12, -12, -12, -12, -12, -12, -12, -12, -12, -12, -12, -12, -12],
+      "E2":     [null, null, null, null, null, 11.8, 11.8, 11.8, null, null, 11.8, 11.8, 11.8],
+      "E2C":    [null, null, null, null, null, null, 31.3, 36, null, null, null, null, null]
+    }
+  }
+}

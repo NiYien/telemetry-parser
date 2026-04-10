@@ -52,6 +52,8 @@ pub struct ModelData {
     pub fixed_fl: Option<f64>,
     /// If true, clear focal length from output (e.g. Leica Q with fixed lens).
     pub clear_fl: bool,
+    /// Brand-specific extra data from JSON (e.g. "pc" for Lumix pixel count).
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// A single crop rule with optional conditions.
@@ -537,7 +539,14 @@ fn parse_brand(json: &serde_json::Value) -> Result<BrandData, String> {
                     .ok_or_else(|| format!("model '{}' missing 'sw' (sensor width)", name))? as f32;
                 let fixed_fl = data_obj.get("fixed_fl").and_then(|v| v.as_f64());
                 let clear_fl = data_obj.get("clear_fl").and_then(|v| v.as_bool()).unwrap_or(false);
-                entries.push((name.clone(), ModelData { sw, fixed_fl, clear_fl }));
+                let mut extra = HashMap::new();
+                for (key, val) in data_obj.iter() {
+                    match key.as_str() {
+                        "sw" | "fixed_fl" | "clear_fl" => {}
+                        _ => { extra.insert(key.clone(), val.clone()); }
+                    }
+                }
+                entries.push((name.clone(), ModelData { sw, fixed_fl, clear_fl, extra }));
             }
             // Sort by name length descending for longest-match priority
             entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));

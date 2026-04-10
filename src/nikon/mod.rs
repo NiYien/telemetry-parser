@@ -85,7 +85,9 @@ impl Nikon {
 
         // NEV frames are ~3.3MB each but metadata (NRFH) is in the first ~1KB.
         // Limit read size to avoid loading full RAW pixel data for every frame.
+        let frame_count = std::cell::Cell::new(0u64);
         util::get_track_samples(stream, size, mp4parse::TrackType::Video, true, Some(4096), |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
+            frame_count.set(frame_count.get() + 1);
             if size > 0 {
                 progress_cb(file_position as f64 / size as f64);
             }

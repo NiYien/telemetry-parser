@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "aliases": {
+    "KOMODO 6K": "KOMODO",
+    "RED RAVEN": "RED RAVEN 4.5K"
+  },
+
+  "models": {
+    "KOMODO":                  { "sw": 36.0 },
+    "KOMODO-X":                { "sw": 36.0 },
+    "V-RAPTOR 8K VV":          { "sw": 40.96 },
+    "V-RAPTOR 8K S35":         { "sw": 26.21 },
+    "HELIUM 8K":               { "sw": 29.9 },
+    "MONSTRO 8K":              { "sw": 40.96 },
+    "GEMINI 5K":               { "sw": 30.72 },
+    "RED RAVEN 4.5K":          { "sw": 23.0 },
+    "DSMC2 DRAGON-X 6K S35":   { "sw": 30.72 },
+    "EPIC":                    { "sw": 30.72 }
+  },
+
+  "readout": {
+    "columns": ["8K60","8K30","8K24","4K240","4K120","4K60","4K30","4K24","1K240","1K120","1K60","1K30","1K24"],
+    "data": {
+      "KOMODO":                [null, null, null, null, null, null, null, null, null, null, null, null, null],
+      "KOMODO-X":              [null, null, null, null, null, null, null, null, null, null, null, null, null],
+      "V-RAPTOR 8K VV":        [null, null, null, null, null, null, null, null, null, null, null, null, null],
+      "V-RAPTOR 8K S35":       [null, null, null, null, null, null, null, null, null, null, null, null, null],
+      "HELIUM 8K":             [null, -3.7, -3.7, null, null, null, -3.7, -3.7, null, null, null, -3.7, -3.7],
+      "MONSTRO 8K":            [null, -3.7, -3.7, null, null, null, -3.7, -3.7, null, null, null, -3.7, -3.7],
+      "GEMINI 5K":             [null, -15.6, -15.6, -15.6, -7.4, -15.6, -15.6, -15.6, null, -7.4, -15.6, -15.6, -15.6],
+      "RED RAVEN 4.5K":        [null, -15.6, -15.6, -15.6, -7.4, -15.6, -15.6, -15.6, null, -7.4, -15.6, -15.6, -15.6],
+      "DSMC2 DRAGON-X 6K S35": [null, null, null, null, null, null, null, null, null, null, null, null, null],
+      "EPIC":                  [null, -12.3, -12.3, -12.3, -7.4, -12.3, -12.3, -12.3, null, -7.4, -12.3, -12.3, -12.3]
+    }
+  }
+}

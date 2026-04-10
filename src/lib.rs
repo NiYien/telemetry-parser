@@ -28,6 +28,8 @@ mod sigma;
 mod leica;
 mod panasonic;
 mod fujifilm;
+mod zcam;
+mod kinefinity;
 pub mod camera_db;
 pub mod tiff_ifd;
 
@@ -197,4 +199,6 @@ impl_formats! {
     Cooke     => cooke::Cooke,
     SenseFlow => senseflow::SenseFlow,
     Freefly   => freefly::Freefly,
+    Zcam      => zcam::Zcam,
+    Kinefinity => kinefinity::Kinefinity,
 }

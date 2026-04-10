@@ -35,6 +35,7 @@ struct PanasonicExifData {
     subsec_time_original: Option<String>,
     image_stabilization: Option<u16>,
     record_frame_rate: Option<u16>,
+    crop_mode: Option<u16>, // MakerNote 0x00E3: 1=FULL, 2=S35/APS-C, 255=PIXEL
 }
 
 impl Panasonic {
@@ -194,7 +195,7 @@ impl Panasonic {
         }
 
         // scale_35mm = focal_length_35mm / focal_length
-        let scale_35mm = match (exif.focal_length_35mm, exif.focal_length) {
+        let mut scale_35mm = match (exif.focal_length_35mm, exif.focal_length) {
             (Some(fl35), Some(fl)) if fl35 > 0 && fl > 0.0 => Some(fl35 as f64 / fl),
             _ => None,
         };
@@ -208,12 +209,43 @@ impl Panasonic {
             util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("DynamicRangeBoost".into()), "Dynamic Range Boost", bool, |v| v.to_string(), true, Vec::new()), options);
         }
 
+        // Write CropMode
+        if let Some(mode) = exif.crop_mode {
+            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("crop_mode".into()), "Crop mode", u16,
+                |v| match *v { 1 => "FULL".into(), 2 => "S35".into(), 255 => "PIXEL".into(), v => format!("{}", v) },
+                mode, Vec::new()), options);
+        }
+
         // Try JSON database first
         if let Some(db_path) = &options.camera_db_path {
             if let Ok(db) = crate::camera_db::CameraDatabase::load(db_path) {
                 if let Some((model_name, model_data)) = db.process_model("LUMIX", raw_model, map, options) {
                     self.model = Some(model_name.to_string());
                     let sensor_w = model_data.sw;
+
+                    // Manual lens: synthesize scale_35mm from crop_mode (MakerNote 0x00E3)
+                    if scale_35mm.is_none() {
+                        scale_35mm = match exif.crop_mode {
+                            Some(2) if sensor_w > 30.0 => Some(1.5), // S35/APS-C on full-frame
+                            Some(255) => { // PIXEL: crop = sqrt(pc * 1.5) / resolution_w
+                                model_data.extra.get("pc")
+                                    .and_then(|v| v.as_u64())
+                                    .and_then(|pc| {
+                                        if resolution_w > 0 {
+                                            let sensor_px_w = (pc as f64 * 1.5).sqrt();
+                                            let crop = sensor_px_w / resolution_w as f64;
+                                            Some(crop * sensor_w as f64 / 36.0)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                            }
+                            _ => None,
+                        };
+                        if let Some(scale) = scale_35mm {
+                            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("scale_35mm".into()), "35mm equivalent scale", f64, |v| format!("{:.2}", v), scale, Vec::new()), options);
+                        }
+                    }
 
                     // Crop factor: use scale_35mm if significantly > 1.0, else JSON crop rules
                     let crop_factor = if let Some(scale) = scale_35mm.filter(|s| (*s - 1.0).abs() > 0.01) {
@@ -237,7 +269,7 @@ impl Panasonic {
                     }
 
                     // Pixel focal length
-                    let fl = exif.focal_length.or(options.user_focal_length);
+                    let fl = exif.focal_length.filter(|f| *f > 0.0).or(options.user_focal_length);
                     if let Some(fl) = fl {
                         if resolution_w > 0 {
                             let fx = if let Some(scale) = scale_35mm.filter(|s| (s - 1.0).abs() > 0.01) {
@@ -441,6 +473,13 @@ fn parse_tiff_ifd(tiff_data: &[u8]) -> Result<PanasonicExifData> {
                                     if typ == 3 && value_data.len() >= 2 {
                                         if let Some(v) = read_u16(value_data, 0, is_le) {
                                             result.record_frame_rate = Some(v);
+                                        }
+                                    }
+                                }
+                                0x00E3 => { // CropMode: 1=FULL, 2=S35/APS-C, 255=PIXEL
+                                    if typ == 3 && value_data.len() >= 2 {
+                                        if let Some(v) = read_u16(value_data, 0, is_le) {
+                                            result.crop_mode = Some(v);
                                         }
                                     }
                                 }

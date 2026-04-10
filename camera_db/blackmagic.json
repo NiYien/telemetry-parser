@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "aliases": {
+    "Pocket Cinema Camera 6K Pro": "BMPCC 6K",
+    "Pocket Cinema Camera 6K G2":  "BMPCC 6K",
+    "Pocket Cinema Camera 6K":     "BMPCC 6K",
+    "Pocket Cinema Camera 4K":     "BMPCC 4K",
+    "Micro Studio Camera 4K G2":   "BMPCC 4K",
+    "Cinema Camera 6K":            "BMCC 6K",
+    "Production Camera 4K":        "BMCC 4K"
+  },
+
+  "models": {
+    "BMPCC":                    { "sw": 12.48 },
+    "BMCC 4K":                  { "sw": 21.12 },
+    "BMCC 6K":                  { "sw": 36.0 },
+    "BMPCC 4K":                 { "sw": 18.96 },
+    "BMPCC 6K":                 { "sw": 23.10 },
+    "URSA Mini 4K":             { "sw": 21.12 },
+    "URSA Mini 4.6K":           { "sw": 25.34 },
+    "URSA Mini Pro 4.6K G2":    { "sw": 25.34 },
+    "URSA Mini Pro 12K":        { "sw": 27.03 }
+  },
+
+  "readout": {
+    "columns": ["8K60","8K30","8K24","4K240","4K120","4K60","4K30","4K24","1K240","1K120","1K60","1K30","1K24"],
+    "data": {
+      "BMPCC":                  [null, null, null, null, null, null, null, null, null, null, null, -20, -20],
+      "BMCC 4K":                [null, null, null, null, null, null, null, null, null, null, null, null, null],
+      "BMCC 6K":                [null, -25, -25, -3, -8.5, -16.6, -19.8, -19.8, null, -8.5, -16.6, -19.8, -19.8],
+      "BMPCC 4K":               [null, null, null, null, -7.7, -10.7, -10.7, -10.7, null, -5.5, -5.5, -5.5, -5.5],
+      "BMPCC 6K":               [null, -19.8, -19.8, -3, -8.5, -16.6, -19.8, -19.8, null, -8.5, -16.6, -19.8, -19.8],
+      "URSA Mini 4K":           [null, null, null, null, null, null, null, null, null, null, null, null, null],
+      "URSA Mini 4.6K":         [null, null, null, null, null, -7.7, -7.7, -7.7, null, null, -3.2, -3.2, -3.2],
+      "URSA Mini Pro 4.6K G2":  [null, null, null, null, null, -7.7, -7.7, -7.7, null, null, -3.2, -3.2, -3.2],
+      "URSA Mini Pro 12K":      [null, -7.8, -7.8, -7.8, -7.8, -7.8, -7.8, -7.8, null, null, null, -3.2, -3.2]
+    },
+    "additional": {
+      "BMCC 6K":           ["OpenGate:6048:4032:25"],
+      "BMPCC 6K":          ["OpenGate:6144:3456:19.8"],
+      "URSA Mini Pro 12K": ["12K:15.7"]
+    }
+  },
+
+  "readout_adjust": [
+    { "type": "override_res", "pattern": "OpenGate:" },
+    { "type": "override_res", "pattern": "12K:" }
+  ]
+}

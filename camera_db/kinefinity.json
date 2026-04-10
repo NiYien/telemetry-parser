@@ -1,0 +1,23 @@
+{
+  "version": 1,
+
+  "aliases": { "mark2 ": "2 " },
+
+  "models": {
+    "MAVO Edge 8K": { "sw": 36 },
+    "MAVO Edge 6K": { "sw": 36 },
+    "MAVO":         { "sw": 24 },
+    "MAVO2 S35":    { "sw": 24 },
+    "MAVO LF":      { "sw": 36 },
+    "MAVO2 LF":     { "sw": 36 },
+    "TERRA 4K":     { "sw": 19.5 }
+  },
+
+  "readout": {
+    "columns": ["8K60","8K30","8K24","4K240","4K120","4K60","4K30","4K24","1K240","1K120","1K60","1K30","1K24"],
+    "data": {
+      "MAVO Edge 6K": [17, 33, 17, null, null, 17, 33, 17, null, null, 17, 33, 17],
+      "TERRA 4K":     [null, null, null, null, 6, 12, 12, 12, null, 3, 6, 6, 6]
+    }
+  }
+}
