@@ -20,6 +20,7 @@ pub struct Nikon {
     mvhd_creation_time: Option<String>,
     electronic_vr: Option<u32>,
     vibration_reduction: Option<u8>,
+    is_proxy: bool,
     is_r3d: bool,
 }
 impl Nikon {
@@ -53,6 +54,7 @@ impl Nikon {
                 mvhd_creation_time: util::extract_mvhd_creation_time(buffer),
                 electronic_vr: None,
                 vibration_reduction: None,
+                is_proxy: false,
                 is_r3d,
             });
         }
@@ -384,6 +386,12 @@ impl Nikon {
                         md.insert("electronic_vr".into(), v.into());
                     }
                 }
+                0x0000_1015 => { // ProxyOutput: 0=Original, 1=Proxy
+                    if let Some(v) = as_u32() {
+                        self.is_proxy = v == 1;
+                        md.insert("proxy_output".into(), v.into());
+                    }
+                }
                 _ => {
                     let key = format!("tag_0x{:08x}", tag_id);
                     match type_id {
@@ -683,9 +691,19 @@ impl Nikon {
                             };
 
                             // Readout (only on first sample)
+                            // Proxy files (N-RAW proxy MP4): use sensor crop area for lookup,
+                            // because the sensor reads full crop area without line-skipping.
+                            // Non-proxy: use container resolution (reflects actual recording mode).
                             if self.frame_readout_time.is_none() {
+                                let (readout_w, readout_h) = if self.is_proxy {
+                                    let rw = md.get("crop_hi_speed_crop_w").and_then(|v| v.as_u64()).unwrap_or(resolution_w as u64) as u32;
+                                    let rh = md.get("crop_hi_speed_crop_h").and_then(|v| v.as_u64()).unwrap_or(resolution_h as u64) as u32;
+                                    (rw, rh)
+                                } else {
+                                    (resolution_w, resolution_h)
+                                };
                                 let tags = std::collections::HashMap::new();
-                                if let Some(rt) = db.process_readout("NIKON", model_name, resolution_w, resolution_h, fps, scale_35mm.unwrap_or(1.0), sensor_w, &tags, map, options) {
+                                if let Some(rt) = db.process_readout("NIKON", model_name, readout_w, readout_h, fps, scale_35mm.unwrap_or(1.0), sensor_w, &tags, map, options) {
                                     self.frame_readout_time = Some(rt);
                                 }
                             }
