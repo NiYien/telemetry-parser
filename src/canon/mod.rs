@@ -70,10 +70,15 @@ impl Canon {
         let is_mxf = header == [0x06, 0x0E, 0x2B, 0x34];
         let mut mxf_creation_time: Option<String> = None;
         let mut mxf_creation_subsec: Option<String> = None;
+        let mut mxf_video_md: Option<util::VideoMetadata> = None;
         let mut samples = if is_mxf { // MXF header
-            let (s, ct, cs) = crate::sony::mxf::parse(stream, size, progress_cb, cancel_flag, None, &options, parse_tags)?;
+            // Canon MXF: use single-pass fast path (Header Metadata + Index Table sparse seek)
+            // instead of legacy 3-pass scan. Skips ST 436 ancillary entirely (Canon MXF has
+            // no IMU data). HDD wall time on 39 GB R5 C MXF: 200s -> ~65-80s.
+            let (s, ct, cs, vmd) = parse_canon_mxf_fast(stream, size, &options, &progress_cb, cancel_flag.clone())?;
             mxf_creation_time = ct;
             mxf_creation_subsec = cs;
+            mxf_video_md = vmd;
             s
         } else {
             let mut samples = Vec::new();
@@ -156,8 +161,10 @@ impl Canon {
             samples
         };
 
-        // Canon MXF second pass: extract model name and per-frame metadata from Canvas Container
-        if is_mxf {
+        // Canon MXF second pass: SUPERSEDED by parse_canon_mxf_fast above.
+        // The fast path already populated samples with Canvas data + camera model name in
+        // a single pass (avoiding a second 39 GB essence scan). Disabling this block.
+        if false && is_mxf {
             stream.seek(SeekFrom::Start(0))?;
             if let Ok((mxf_model, canvas_frames)) = parse_mxf_canon_extra(stream, size) {
                 let has_st436_samples = !samples.is_empty();
@@ -229,8 +236,14 @@ impl Canon {
         }
 
         // Get video track metadata (resolution, fps)
-        stream.seek(SeekFrom::Start(0))?;
-        let video_md = util::get_video_metadata(stream, size).ok();
+        // For MXF: use the metadata already extracted by parse_canon_mxf_fast; otherwise
+        // fall back to the third full-file scan (only needed for non-MXF Canon files).
+        let video_md = if is_mxf {
+            mxf_video_md
+        } else {
+            stream.seek(SeekFrom::Start(0))?;
+            util::get_video_metadata(stream, size).ok()
+        };
 
         // Parse Canon UUID EXIF for canon_fine, canon_crop, and fallback metadata (MP4 only)
         stream.seek(SeekFrom::Start(0))?;
@@ -841,4 +854,449 @@ pub fn parse_tags(data: &[u8], options: &crate::InputOptions, map: &mut GroupedT
         }
     }
     Ok(())
+}
+
+// ============================================================================
+// Canon MXF Fast Path
+// ============================================================================
+//
+// Replaces 3-pass full-file scan (sony::mxf::parse + parse_mxf_canon_extra +
+// get_video_metadata) with a single optimized pass:
+//   1. Read front 4 MiB (Header Partition + Header Metadata + Index Table)
+//   2. Walk KLVs, collect Identification/Descriptor/Preface/SourceClip + all
+//      EU StreamOffsets from Index Table Segments
+//   3. Locate Canvas Container in EU[0], compute its byte distance from the
+//      next EU's start (this distance is constant across frames)
+//   4. Sparse-sample Canvas at fps/10 stride using Index-Table-driven seeks
+//   5. Linear-interpolate focal_length / fl_35mm_equiv across non-sampled
+//      frames; nearest-neighbor for ISO / shutter / aperture
+//   6. Skip ST 436 ancillary scan entirely (Canon MXF has no IMU data)
+//
+// HDD wall time on 39 GB R5 C MXF: 200 s -> ~65-80 s (verified via Python POC)
+
+const CANON_MXF_FAST_FRONT_BYTES: usize = 4 * 1024 * 1024;
+const CANON_MXF_FAST_EU0_BYTES: usize = 4 * 1024 * 1024;
+const CANON_MXF_FAST_READ_WINDOW: usize = 800;
+const CANON_MXF_FAST_SEEK_BACKOFF: u64 = 200;
+const CANON_MXF_FAST_EARLY_TERM_FOCAL_MM: f32 = 5.0;
+const CANON_MXF_FAST_EARLY_TERM_CONSECUTIVE: usize = 5;
+
+fn read_ber_buf(data: &[u8]) -> Option<(u64, usize)> {
+    if data.is_empty() { return None; }
+    let b = data[0];
+    if b & 0x80 == 0 {
+        return Some((b as u64, 1));
+    }
+    let n = (b & 0x7F) as usize;
+    if n == 0 || n > 8 || 1 + n > data.len() { return None; }
+    let mut v: u64 = 0;
+    for i in 0..n {
+        v = (v << 8) | data[1 + i] as u64;
+    }
+    Some((v, 1 + n))
+}
+
+// Append per-EU stream offsets from one Index Table Segment to `out`.
+fn parse_index_table_segment(seg: &[u8], out: &mut Vec<u64>) {
+    let mut entries: Option<&[u8]> = None;
+    let mut j = 0;
+    while j + 4 <= seg.len() {
+        let tag = u16::from_be_bytes([seg[j], seg[j + 1]]);
+        let llen = u16::from_be_bytes([seg[j + 2], seg[j + 3]]) as usize;
+        j += 4;
+        if j + llen > seg.len() { break; }
+        if tag == 0x3F0A {
+            entries = Some(&seg[j..j + llen]);
+        }
+        j += llen;
+    }
+    if let Some(ea) = entries {
+        if ea.len() >= 8 {
+            let count = u32::from_be_bytes([ea[0], ea[1], ea[2], ea[3]]) as usize;
+            let elem_size = u32::from_be_bytes([ea[4], ea[5], ea[6], ea[7]]) as usize;
+            // Per IndexEntry: TempOff(s8) + KFOff(s8) + Flags(u8) + StreamOffset(u64) + slices*u32
+            if elem_size >= 11 && 8 + count * elem_size <= ea.len() {
+                out.reserve(count);
+                for k in 0..count {
+                    let eo = 8 + k * elem_size;
+                    let stream_off = u64::from_be_bytes([
+                        ea[eo + 3], ea[eo + 4], ea[eo + 5], ea[eo + 6],
+                        ea[eo + 7], ea[eo + 8], ea[eo + 9], ea[eo + 10],
+                    ]);
+                    out.push(stream_off);
+                }
+            }
+        }
+    }
+}
+
+// Find the value bytes for a given local-set tag.
+fn parse_local_set_tag<'a>(set_data: &'a [u8], target_tag: u16) -> Option<&'a [u8]> {
+    let mut j = 0;
+    while j + 4 <= set_data.len() {
+        let tag = u16::from_be_bytes([set_data[j], set_data[j + 1]]);
+        let llen = u16::from_be_bytes([set_data[j + 2], set_data[j + 3]]) as usize;
+        j += 4;
+        if j + llen > set_data.len() { break; }
+        if tag == target_tag {
+            return Some(&set_data[j..j + llen]);
+        }
+        j += llen;
+    }
+    None
+}
+
+// Preface Set's LastModifiedDate (tag 0x3B02, 8-byte timestamp).
+fn parse_preface_last_modified(preface: &[u8]) -> Option<(String, Option<String>)> {
+    let v = parse_local_set_tag(preface, 0x3B02)?;
+    if v.len() < 8 { return None; }
+    let year = u16::from_be_bytes([v[0], v[1]]);
+    let ts = format!("{:04}:{:02}:{:02} {:02}:{:02}:{:02}", year, v[2], v[3], v[4], v[5], v[6]);
+    let msec = (v[7] as u32) * 4;
+    Some((ts, Some(format!("{:03}", msec))))
+}
+
+// Identification Set's Application Name (tag 0x3C02, UTF-16).
+fn parse_identification_app_name(ident: &[u8]) -> Option<String> {
+    let v = parse_local_set_tag(ident, 0x3C02)?;
+    decode_mxf_utf16(v).filter(|s| !s.is_empty())
+}
+
+// Picture Descriptor: returns (VideoMetadata, frame_rate).
+fn parse_picture_descriptor(desc: &[u8], duration_fallback: u64) -> Option<(util::VideoMetadata, f64)> {
+    let mut frame_rate = 25.0;
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut duration = duration_fallback;
+    let mut j = 0;
+    while j + 4 <= desc.len() {
+        let tag = u16::from_be_bytes([desc[j], desc[j + 1]]);
+        let llen = u16::from_be_bytes([desc[j + 2], desc[j + 3]]) as usize;
+        j += 4;
+        if j + llen > desc.len() { break; }
+        let v = &desc[j..j + llen];
+        match tag {
+            0x3001 => if v.len() >= 8 {
+                let num = u32::from_be_bytes([v[0], v[1], v[2], v[3]]) as f64;
+                let den = u32::from_be_bytes([v[4], v[5], v[6], v[7]]) as f64;
+                if den > 0.0 { frame_rate = num / den; }
+            },
+            0x3209 => if v.len() >= 4 {
+                width = u32::from_be_bytes([v[0], v[1], v[2], v[3]]);
+            },
+            0x3208 => if v.len() >= 4 {
+                height = u32::from_be_bytes([v[0], v[1], v[2], v[3]]);
+            },
+            0x3002 => if v.len() >= 8 {
+                duration = u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]);
+            },
+            0x0202 => if v.len() >= 8 && duration == duration_fallback {
+                duration = u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]);
+            },
+            _ => {}
+        }
+        j += llen;
+    }
+    if width == 0 || height == 0 || frame_rate <= 0.0 { return None; }
+    Some((util::VideoMetadata {
+        width: width as usize,
+        height: height as usize,
+        fps: frame_rate,
+        duration_s: if frame_rate > 0.0 { duration as f64 / frame_rate } else { 0.0 },
+        rotation: 0,
+    }, frame_rate))
+}
+
+// SourceClip's Duration (tag 0x3002 ContainerDuration or 0x0202 Duration).
+fn parse_source_clip_duration(sc: &[u8]) -> Option<u64> {
+    parse_local_set_tag(sc, 0x3002)
+        .or_else(|| parse_local_set_tag(sc, 0x0202))
+        .and_then(|v| if v.len() >= 8 {
+            Some(u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]))
+        } else {
+            None
+        })
+}
+
+// Parse a Canvas Container KLV at the given byte position in `buf`.
+fn parse_canvas_klv_at(buf: &[u8], pos: usize) -> Option<MxfCanvasFrame> {
+    if pos + 16 + 4 > buf.len() { return None; }
+    let (klv_len, ber_size) = read_ber_buf(&buf[pos + 16..])?;
+    let val_start = pos + 16 + ber_size;
+    let val_end = val_start.checked_add(klv_len as usize)?;
+    if val_end > buf.len() { return None; }
+    let canvas_data = &buf[val_start..val_end];
+    let fl_key: [u8; 16] = [
+        0x06, 0x0E, 0x2B, 0x34, 0x01, 0x01, 0x01, 0x0D,
+        0x0E, 0x15, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+    ];
+    let mut frame = MxfCanvasFrame::default();
+    if let Some(fl_pos) = memmem::find(canvas_data, &fl_key) {
+        if let Some(fl_data) = read_sub_klv_data(canvas_data, fl_pos) {
+            parse_canvas_keys(fl_data, &mut frame);
+        }
+    }
+    Some(frame)
+}
+
+// Linear interp focal/fl35; nearest-neighbor iso/shutter/aperture.
+fn interpolate_canvas_frame(samples: &[(usize, MxfCanvasFrame)], frame_idx: usize) -> MxfCanvasFrame {
+    if samples.is_empty() {
+        return MxfCanvasFrame::default();
+    }
+    let (lo, hi) = match samples.binary_search_by_key(&frame_idx, |s| s.0) {
+        Ok(i) => return samples[i].1.clone(),
+        Err(i) => {
+            if i == 0 { return samples[0].1.clone(); }
+            if i >= samples.len() { return samples[samples.len() - 1].1.clone(); }
+            (i - 1, i)
+        }
+    };
+    let (lo_idx, lo_cf) = (samples[lo].0, &samples[lo].1);
+    let (hi_idx, hi_cf) = (samples[hi].0, &samples[hi].1);
+    let span = (hi_idx - lo_idx).max(1) as f32;
+    let t = (frame_idx - lo_idx) as f32 / span;
+
+    let interp = |a: Option<f32>, b: Option<f32>| match (a, b) {
+        (Some(a), Some(b)) => Some(a + (b - a) * t),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        _ => None,
+    };
+    let nearest = if t < 0.5 { lo_cf } else { hi_cf };
+
+    MxfCanvasFrame {
+        focal_length: interp(lo_cf.focal_length, hi_cf.focal_length),
+        fl_35mm_equiv: interp(lo_cf.fl_35mm_equiv, hi_cf.fl_35mm_equiv),
+        iso: nearest.iso.or(lo_cf.iso).or(hi_cf.iso),
+        shutter: nearest.shutter.or(lo_cf.shutter).or(hi_cf.shutter),
+        aperture: nearest.aperture.or(lo_cf.aperture).or(hi_cf.aperture),
+    }
+}
+
+// Single-pass Canon MXF parse using Index Table sparse seeks.
+// Returns: (samples, creation_time, creation_subsec, video_metadata)
+pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
+    stream: &mut T,
+    size: usize,
+    options: &crate::InputOptions,
+    progress_cb: &F,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<(Vec<SampleInfo>, Option<String>, Option<String>, Option<util::VideoMetadata>)> {
+    // Step 1: read front 4 MiB
+    stream.seek(SeekFrom::Start(0))?;
+    let front_size = CANON_MXF_FAST_FRONT_BYTES.min(size.max(1));
+    let mut front = vec![0u8; front_size];
+    stream.read_exact(&mut front)?;
+
+    // Step 2: walk KLVs
+    let mut creation_time: Option<String> = None;
+    let mut creation_subsec: Option<String> = None;
+    let mut model_name: Option<String> = None;
+    let mut video_md: Option<util::VideoMetadata> = None;
+    let mut frame_rate: f64 = 25.0;
+    let mut max_duration: u64 = 0;
+    let mut eu_offsets: Vec<u64> = Vec::with_capacity(100_000);
+    let mut essence_start: Option<u64> = None;
+
+    let mut i: usize = 0;
+    while i + 16 < front.len() {
+        if &front[i..i + 4] != &[0x06, 0x0E, 0x2B, 0x34] {
+            i += 1;
+            continue;
+        }
+        let key = &front[i..i + 16];
+        let (length, ber_size) = match read_ber_buf(&front[i + 16..]) {
+            Some(x) => x,
+            None => break,
+        };
+        let val_start = i + 16 + ber_size;
+        let val_end = match val_start.checked_add(length as usize) {
+            Some(v) => v,
+            None => break,
+        };
+
+        // Generic Container essence element key: byte[4]=0x01, byte[12] in {0x14..0x18}
+        let is_essence = key[4] == 0x01
+            && (key[12] == 0x14 || key[12] == 0x15 || key[12] == 0x16 || key[12] == 0x17 || key[12] == 0x18);
+        if is_essence && essence_start.is_none() {
+            essence_start = Some(i as u64);
+            break;
+        }
+
+        if val_end > front.len() {
+            // KLV extends beyond front buffer; can't safely continue
+            break;
+        }
+
+        let val = &front[val_start..val_end];
+
+        // Preface Set
+        if key == &[0x06, 0x0E, 0x2B, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0D, 0x01, 0x01, 0x01, 0x01, 0x01, 0x2F, 0x00] {
+            if let Some((ts, ss)) = parse_preface_last_modified(val) {
+                creation_time = Some(ts);
+                creation_subsec = ss;
+            }
+        }
+        // Identification Set
+        else if key == &[0x06, 0x0E, 0x2B, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0D, 0x01, 0x01, 0x01, 0x01, 0x01, 0x30, 0x00] {
+            if let Some(name) = parse_identification_app_name(val) {
+                model_name = Some(name);
+            }
+        }
+        // Picture Descriptor (CDCI / RGBA / Generic / VC1 / MPEG)
+        else if key.starts_with(&[0x06, 0x0E, 0x2B, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0D, 0x01, 0x01, 0x01, 0x01, 0x01])
+            && (key[14] == 0x27 || key[14] == 0x28 || key[14] == 0x29 || key[14] == 0x51 || key[14] == 0x5F)
+        {
+            if let Some((vmd, fr)) = parse_picture_descriptor(val, max_duration) {
+                video_md = Some(vmd);
+                frame_rate = fr;
+            }
+        }
+        // SourceClip Set
+        else if key == &[0x06, 0x0E, 0x2B, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0D, 0x01, 0x01, 0x01, 0x01, 0x01, 0x11, 0x00] {
+            if let Some(d) = parse_source_clip_duration(val) {
+                if d > max_duration { max_duration = d; }
+            }
+        }
+        // Index Table Segment
+        else if key == &[0x06, 0x0E, 0x2B, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0D, 0x01, 0x02, 0x01, 0x01, 0x10, 0x01, 0x00] {
+            parse_index_table_segment(val, &mut eu_offsets);
+        }
+
+        i = val_end;
+    }
+
+    // Patch up duration_s if Picture Descriptor lacked its own duration tag
+    if let Some(ref mut vmd) = video_md {
+        if vmd.duration_s == 0.0 && max_duration > 0 && frame_rate > 0.0 {
+            vmd.duration_s = max_duration as f64 / frame_rate;
+        }
+    }
+
+    let essence_start = essence_start.ok_or_else(|| Error::new(
+        ErrorKind::InvalidData,
+        format!("Canon MXF fast path: essence_start not found in first {} MiB", CANON_MXF_FAST_FRONT_BYTES / 1024 / 1024),
+    ))?;
+
+    if eu_offsets.len() < 2 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("Canon MXF fast path: Index Table has {} entries, need at least 2", eu_offsets.len()),
+        ));
+    }
+
+    // Step 3: locate Canvas in EU[0]
+    let eu0_avail = (size as u64).saturating_sub(essence_start) as usize;
+    let eu0_size = CANON_MXF_FAST_EU0_BYTES.min(eu0_avail);
+    if eu0_size == 0 {
+        return Err(Error::new(ErrorKind::InvalidData, "Canon MXF fast path: no essence bytes available"));
+    }
+    let mut eu0 = vec![0u8; eu0_size];
+    stream.seek(SeekFrom::Start(essence_start))?;
+    stream.read_exact(&mut eu0)?;
+
+    let canvas_key: [u8; 16] = [
+        0x06, 0x0E, 0x2B, 0x34, 0x02, 0x43, 0x01, 0x01,
+        0x0D, 0x01, 0x03, 0x01, 0x04, 0x01, 0x02, 0x03,
+    ];
+    let canvas_pos_in_eu0 = memmem::find(&eu0, &canvas_key).ok_or_else(|| Error::new(
+        ErrorKind::InvalidData,
+        format!("Canon MXF fast path: Canvas Container not found in first {} MiB of essence", CANON_MXF_FAST_EU0_BYTES / 1024 / 1024),
+    ))?;
+
+    let eu1_offset = eu_offsets[1];
+    if eu1_offset as usize <= canvas_pos_in_eu0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("Canon MXF fast path: Canvas pos {} >= EU[1] offset {}", canvas_pos_in_eu0, eu1_offset),
+        ));
+    }
+    let canvas_dist_from_next_eu = eu1_offset - canvas_pos_in_eu0 as u64;
+
+    // Parse Canvas at EU[0]
+    let mut sampled: Vec<(usize, MxfCanvasFrame)> = Vec::new();
+    if let Some(cf) = parse_canvas_klv_at(&eu0, canvas_pos_in_eu0) {
+        sampled.push((0, cf));
+    }
+
+    // Step 4: sparse-sample remaining EUs
+    let n_eu = eu_offsets.len();
+    let sample_step = ((frame_rate / 10.0).round() as usize).max(1);
+    let mut consec_invalid: usize = 0;
+
+    let mut chunk = vec![0u8; CANON_MXF_FAST_READ_WINDOW];
+    let mut sample_i = sample_step;
+    while sample_i + 1 < n_eu {
+        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let next_eu_off = eu_offsets[sample_i + 1];
+        let canvas_abs = essence_start + next_eu_off - canvas_dist_from_next_eu;
+        let seek_target = canvas_abs.saturating_sub(CANON_MXF_FAST_SEEK_BACKOFF);
+        if seek_target + CANON_MXF_FAST_READ_WINDOW as u64 > size as u64 {
+            break;
+        }
+        stream.seek(SeekFrom::Start(seek_target))?;
+        if stream.read_exact(&mut chunk).is_err() {
+            break;
+        }
+        if let Some(pos) = memmem::find(&chunk, &canvas_key) {
+            if let Some(cf) = parse_canvas_klv_at(&chunk, pos) {
+                let valid = cf.focal_length.map_or(false, |f| f >= CANON_MXF_FAST_EARLY_TERM_FOCAL_MM);
+                if !valid {
+                    consec_invalid += 1;
+                    if consec_invalid >= CANON_MXF_FAST_EARLY_TERM_CONSECUTIVE {
+                        log::info!("Canon MXF fast path: early termination after {} consecutive invalid focal samples", consec_invalid);
+                        break;
+                    }
+                } else {
+                    consec_invalid = 0;
+                }
+                sampled.push((sample_i, cf));
+                progress_cb(sample_i as f64 / n_eu as f64);
+            }
+        }
+        sample_i += sample_step;
+    }
+    progress_cb(1.0);
+
+    log::info!(
+        "Canon MXF fast path: {} EUs total, sampled {} (step={}, fps={:.3})",
+        n_eu, sampled.len(), sample_step, frame_rate
+    );
+
+    // Step 5: build per-frame samples with interpolation
+    let duration_ms = if frame_rate > 0.0 { 1000.0 / frame_rate } else { 40.0 };
+    let mut samples = Vec::with_capacity(n_eu);
+    for frame_i in 0..n_eu {
+        let cf = interpolate_canvas_frame(&sampled, frame_i);
+        let mxf_crop = match (cf.focal_length, cf.fl_35mm_equiv) {
+            (Some(fl), Some(fl35)) if fl > 0.0 => Some(fl35 as f64 / fl as f64),
+            _ => None,
+        };
+        let mut tag_map = GroupedTagMap::new();
+        write_canvas_tags(&mut tag_map, &cf, mxf_crop, options);
+
+        if frame_i == 0 {
+            if let Some(ref m) = model_name {
+                let model_clean = m.strip_prefix("Canon ").unwrap_or(m).to_string();
+                util::insert_tag(
+                    &mut tag_map,
+                    tag!(parsed GroupId::Default, TagId::Name, "Camera model", String, |v| v.to_string(), model_clean, Vec::new()),
+                    options,
+                );
+            }
+        }
+
+        samples.push(SampleInfo {
+            sample_index: frame_i as u64,
+            duration_ms,
+            timestamp_ms: frame_i as f64 * duration_ms,
+            tag_map: Some(tag_map),
+            ..Default::default()
+        });
+    }
+
+    Ok((samples, creation_time, creation_subsec, video_md))
 }
