@@ -17,6 +17,29 @@ pub fn to_hex(data: &[u8]) -> String {
     ret
 }
 
+/// Resolve per-frame metadata sampling stride from InputOptions + frame_rate.
+///
+/// Used by all fast-path parsers (Canon MXF, Canon ISOBMFF, Nikon NEV, RED R3D).
+/// `user_stride` is `InputOptions::metadata_sample_stride`:
+///   - `None`     -> auto-pick `round(fps / 10).max(1)` (~10 Hz sampling rate)
+///   - `Some(0)`  -> treated as 1 (degenerate case, falls back to per-frame)
+///   - `Some(N)`  -> sample every N-th frame
+///
+/// Returns the stride in frames (always >= 1).
+pub fn resolve_sample_stride(user_stride: Option<usize>, frame_rate: f64) -> usize {
+    match user_stride {
+        Some(n) if n >= 1 => n,
+        Some(_) => 1, // Some(0) -> per-frame
+        None => {
+            if frame_rate > 0.0 {
+                ((frame_rate / 10.0).round() as usize).max(1)
+            } else {
+                1
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SampleInfo {
     pub sample_index: u64,
@@ -399,6 +422,119 @@ pub fn get_other_track_samples<F, T: Read + Seek>(stream: &mut T, size: usize, s
     where F: FnMut(SampleInfo, &[u8], u64, Option<&VideoMetadata>)
 {
     get_track_samples(stream, size, mp4parse::TrackType::Unknown, single, None, callback, cancel_flag)
+}
+
+/// Variant of get_track_samples with sparse sampling stride support.
+///
+/// Skips non-strided samples to reduce HDD seek count. Returns
+/// `(MediaContext, total_sample_count, used_stride)` so the caller knows the
+/// original frame count (for interpolation) and which stride was actually used
+/// (auto-resolved from fps if `user_stride` is None).
+///
+/// `user_stride`:
+///   - `None`     -> auto-resolve to `round(fps / 10).max(1)` (~10 Hz sampling)
+///   - `Some(N)`  -> sample every N-th frame (use N=1 for full per-frame)
+pub fn get_track_samples_strided<F, T: Read + Seek>(
+    stream: &mut T,
+    size: usize,
+    mut typ: mp4parse::TrackType,
+    single: bool,
+    user_stride: Option<usize>,
+    max_sample_size: Option<usize>,
+    mut callback: F,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<(MediaContext, u64, usize)>
+    where F: FnMut(SampleInfo, &[u8], u64, Option<&VideoMetadata>)
+{
+    let ctx = parse_mp4(stream, size).or_else(|_| mp4parse::read_mp4(stream, mp4parse::ParseStrictness::Permissive))?;
+
+    let mut track_index = 0;
+    let mut video_md = None;
+    let mut video_rotation = None;
+    let mut total_count: u64 = 0;
+
+    if typ == mp4parse::TrackType::Metadata && !ctx.tracks.iter().any(|x| x.track_type == mp4parse::TrackType::Metadata) && ctx.tracks.iter().any(|x| x.track_type == mp4parse::TrackType::Unknown) {
+        typ = mp4parse::TrackType::Unknown;
+    }
+
+    // Resolve fps from video track first so stride can be auto-computed
+    let fps = ctx.tracks.iter()
+        .find(|t| t.track_type == mp4parse::TrackType::Video)
+        .and_then(|t| get_video_metadata_from_track(t).ok())
+        .map(|vmd| vmd.fps)
+        .unwrap_or(0.0);
+    let stride = resolve_sample_stride(user_stride, fps);
+    let used_stride: usize = stride;
+
+    for x in &ctx.tracks {
+        if x.track_type == mp4parse::TrackType::Video && video_md.is_none() {
+            video_md = get_video_metadata_from_track(x).ok();
+            video_rotation = video_md.as_ref().map(|x| x.rotation);
+        }
+        if x.track_type == typ {
+            if let Some(timescale) = x.timescale {
+                if let Some(samples) = mp4parse::unstable::create_sample_table(&x, 0.into()) {
+                    let mut sample_data = Vec::new();
+                    let mut sample_index = 0u64;
+                    let mut emit_index = 0u64; // index of emitted (strided) sample
+                    for s in samples {
+                        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) { break; }
+
+                        // Apply stride: skip non-strided frames entirely (no seek, no read)
+                        let is_strided = stride <= 1 || (sample_index as usize) % stride == 0;
+
+                        let mut sample_size = (s.end_offset.0 - s.start_offset.0) as usize;
+                        if let Some(max_sample_size) = max_sample_size {
+                            if sample_size > max_sample_size {
+                                sample_size = max_sample_size;
+                            }
+                        }
+                        let start_comp_ms = mp4parse::unstable::track_time_to_us(mp4parse::TrackScaledTime::<i64>(s.start_composition.0, x.id), mp4parse::TrackTimeScale::<i64>(timescale.0 as i64, timescale.1)).ok_or(mp4parse::Error::InvalidData(mp4parse::Status::MvhdBadTimescale))?.0 as f64 / 1000.0;
+                        let end_comp_ms   = mp4parse::unstable::track_time_to_us(mp4parse::TrackScaledTime::<i64>(s.end_composition.0,   x.id), mp4parse::TrackTimeScale::<i64>(timescale.0 as i64, timescale.1)).ok_or(mp4parse::Error::InvalidData(mp4parse::Status::MvhdBadTimescale))?.0 as f64 / 1000.0;
+                        let sample_timestamp_ms = start_comp_ms;
+                        let sample_duration_ms = end_comp_ms - start_comp_ms;
+                        if sample_size > 4 {
+                            if is_strided {
+                                if sample_data.len() != sample_size {
+                                    sample_data.resize(sample_size, 0u8);
+                                }
+                                stream.seek(SeekFrom::Start(s.start_offset.0 as u64))?;
+                                stream.read_exact(&mut sample_data[..])?;
+                                callback(
+                                    SampleInfo { sample_index: emit_index, track_index, timestamp_ms: sample_timestamp_ms, duration_ms: sample_duration_ms, tag_map: None, video_rotation },
+                                    &sample_data,
+                                    s.start_offset.0 as u64,
+                                    video_md.as_ref()
+                                );
+                                emit_index += 1;
+                            }
+                            sample_index += 1;
+                        }
+                    }
+                    total_count = sample_index;
+                    if single {
+                        break;
+                    }
+                }
+            }
+        }
+        track_index += 1;
+    }
+    Ok((ctx, total_count, used_stride))
+}
+
+/// Convenience wrapper for metadata tracks.
+pub fn get_metadata_track_samples_strided<F, T: Read + Seek>(
+    stream: &mut T,
+    size: usize,
+    single: bool,
+    user_stride: Option<usize>,
+    callback: F,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<(MediaContext, u64, usize)>
+    where F: FnMut(SampleInfo, &[u8], u64, Option<&VideoMetadata>)
+{
+    get_track_samples_strided(stream, size, mp4parse::TrackType::Metadata, single, user_stride, None, callback, cancel_flag)
 }
 
 pub fn read_beginning_and_end<T: Read + Seek>(stream: &mut T, stream_size: usize, read_size: usize) -> Result<Vec<u8>> {

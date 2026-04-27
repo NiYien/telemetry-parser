@@ -83,7 +83,11 @@ impl Canon {
         } else {
             let mut samples = Vec::new();
             let cancel_flag2 = cancel_flag.clone();
-            util::get_metadata_track_samples(stream, size, true, |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
+            // Canon MOV/MP4/CRM (ISOBMFF) fast path: sparse-sample metadata track at
+            // configurable stride (InputOptions::metadata_sample_stride). Default = fps/10.
+            // Trade-off: stride > 1 reduces HDD seek count but lowers IMU temporal resolution.
+            // Use stride = 1 for full per-frame metadata (preserves all gyro/accel samples).
+            let _strided_result = util::get_metadata_track_samples_strided(stream, size, true, options.metadata_sample_stride, |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
                 if size > 0 {
                     progress_cb(file_position as f64 / size as f64);
                 }
@@ -1222,7 +1226,7 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
 
     // Step 4: sparse-sample remaining EUs
     let n_eu = eu_offsets.len();
-    let sample_step = ((frame_rate / 10.0).round() as usize).max(1);
+    let sample_step = util::resolve_sample_stride(options.metadata_sample_stride, frame_rate);
     let mut consec_invalid: usize = 0;
 
     let mut chunk = vec![0u8; CANON_MXF_FAST_READ_WINDOW];

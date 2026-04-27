@@ -113,6 +113,16 @@ impl RedR3d {
 
         let total_count = all_parts.len() as f64;
 
+        // R3D sparse sampling: parse per-frame metadata only every Nth RDI block.
+        // R3D has no Index Table, so we still walk the file sequentially, but skip
+        // the 4 KiB header read + parse_meta on non-strided RDI blocks. Stride is
+        // resolved here using record_framerate (if known from prior RED2 metadata)
+        // or defaults to fps=24 if absent. User can override via
+        // InputOptions::metadata_sample_stride. Use stride = 1 for full per-frame.
+        let stride_fps = self.record_framerate.unwrap_or(24.0);
+        let rdi_stride = util::resolve_sample_stride(options.metadata_sample_stride, stride_fps);
+        let mut rdi_index: usize = 0;
+
         'files: for (i, path) in all_parts.into_iter().enumerate() {
             let ext = filesystem::get_extension(path.as_str());
             if ext == "rmd" {
@@ -182,7 +192,8 @@ impl RedR3d {
                         break 'files;
                     }
                 } else if &name == b"RDI\x01" {
-                    if aligned_size >= 4096 {
+                    let is_strided = rdi_stride <= 1 || rdi_index % rdi_stride == 0;
+                    if aligned_size >= 4096 && is_strided {
                         stream.read_exact(&mut data4096)?;
                         stream.seek(SeekFrom::Current(aligned_size as i64 - 8 - 4096))?;
                         let frame_timestamp = (&data4096[56..]).read_u64::<BigEndian>()?;
@@ -196,8 +207,10 @@ impl RedR3d {
                             samples.push(SampleInfo { tag_map: Some(per_frame_map), ..Default::default() });
                         }
                     } else {
+                        // Skip 4 KiB header read on non-strided RDI (or undersized block)
                         stream.seek(SeekFrom::Current(aligned_size as i64 - 8))?;
                     }
+                    rdi_index += 1;
                     if options.probe_only {
                         break 'files;
                     }

@@ -70,6 +70,13 @@ pub struct InputOptions {
     pub header_only: bool,
     /// SenseFlow: time range in ms relative to file start. Parser seeks to computed byte offset.
     pub time_range_ms: Option<(f64, f64)>,
+    /// Per-frame metadata sampling stride for fast paths (Canon MXF, ISOBMFF, R3D).
+    /// `None` (default) -> auto-pick `round(fps / 10).max(1)` (~10 Hz sampling).
+    /// `Some(1)` -> read every frame's metadata (lossless, no interpolation).
+    /// `Some(N)` -> read every N-th frame; non-sampled frames get linear-interpolated
+    /// focal_length / fl_35mm_equiv and nearest-neighbor ISO / shutter / aperture.
+    /// Trade-off: smaller N = more accurate per-frame data but slower I/O on HDD.
+    pub metadata_sample_stride: Option<usize>,
 }
 
 macro_rules! impl_formats {
