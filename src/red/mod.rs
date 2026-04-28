@@ -296,7 +296,7 @@ impl RedR3d {
         util::insert_tag(&mut map, tag!(parsed GroupId::Gyroscope,     TagId::Unit, "Gyroscope unit",     String, |v| v.to_string(), "deg/s".into(), Vec::new()), &options);
 
         if let Some(fr) = self.record_framerate {
-            util::insert_tag(&mut map, tag!(parsed GroupId::Default,   TagId::FrameRate, "Frame rate", f64, |v| format!("{:?}", v), fr, vec![]), &options);
+            util::insert_tag(&mut map, tag!(parsed GroupId::Default,   TagId::RecordFrameRate, "Record frame rate", f64, |v| format!("{:?}", v), fr, vec![]), &options);
         }
 
         let imu_orientation = "zyx";
@@ -403,6 +403,7 @@ impl RedR3d {
                         // Older RED cameras (e.g. EPIC) store the model in camera_network_name (0x71) instead of camera_model (0xA0)
                         if id == "camera_network_name" && self.model.is_none() { self.model = v.as_str().map(|x| x.to_string()); }
                         if id == "record_framerate" { self.record_framerate = v.as_f64(); }
+                        if id == "record_fps" { self.record_framerate = v.as_f64().map(|x| if x > 1000.0 { x / 1001.0 } else { x }); }
 
                         items.push(v);
                         // log::debug!("{}: {:?}", id, v);
