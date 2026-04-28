@@ -308,6 +308,21 @@ impl RedR3d {
         Ok(samples)
     }
 
+    fn red_datetime(md: &serde_json::Map<String, serde_json::Value>, date_key: &str, time_key: &str) -> Option<String> {
+        fn clean(v: &serde_json::Value) -> Option<&str> {
+            Some(v.as_str()?.trim_end_matches('\0').trim())
+        }
+        let date = clean(md.get(date_key)?)?;
+        let time = clean(md.get(time_key)?)?;
+        if date.len() == 8 && time.len() >= 6 && date.bytes().all(|x| x.is_ascii_digit()) && time.bytes().take(6).all(|x| x.is_ascii_digit()) {
+            Some(format!("{}:{}:{} {}:{}:{}", &date[0..4], &date[4..6], &date[6..8], &time[0..2], &time[2..4], &time[4..6]))
+        } else if date.len() == 10 && time.len() >= 8 {
+            Some(format!("{} {}", date, &time[0..8]))
+        } else {
+            None
+        }
+    }
+
     pub fn parse_meta(&mut self, mut data: &[u8], map: &mut GroupedTagMap, options: &crate::InputOptions) -> Result<()> {
         let mut md = serde_json::Map::<String, serde_json::Value>::new();
         while let Ok(size) = data.read_u16::<BigEndian>() {
@@ -424,6 +439,22 @@ impl RedR3d {
             }
         }
         if !md.is_empty() {
+            let gmt = Self::red_datetime(&md, "gmt_date", "gmt_time");
+            let local = Self::red_datetime(&md, "local_date", "local_time");
+            if let Some(ref gmt) = gmt {
+                if let Some(ref local) = local {
+                    if let Some(tz) = util::infer_timezone(local, gmt) {
+                        util::write_creation_date_tags(map, local, Some(&tz), None, options);
+                    } else {
+                        util::write_creation_date_tags(map, gmt, None, None, options);
+                    }
+                } else {
+                    util::write_creation_date_tags(map, gmt, None, None, options);
+                }
+            } else if let Some(ref local) = local {
+                util::write_creation_date_tags(map, local, None, None, options);
+            }
+
             if let Some(v) = md.get("focal_length").and_then(|v| v.as_f64()) {
                 util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{v:.3}"), v as f32, vec![]), &options);
             }
