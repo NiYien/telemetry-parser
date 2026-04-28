@@ -455,7 +455,7 @@ impl RedR3d {
                 util::write_creation_date_tags(map, local, None, None, options);
             }
 
-            if let Some(v) = md.get("focal_length").and_then(|v| v.as_f64()) {
+            if let Some(v) = md.get("focal_length").and_then(|v| v.as_f64()).filter(|v| *v > 0.0) {
                 util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{v:.3}"), v as f32, vec![]), &options);
             }
             if let Some(v) = md.get("lens_name").and_then(|v| v.as_str()) {
@@ -463,14 +463,17 @@ impl RedR3d {
             }
 
             // Hardcoded pixel_pitch for known models (nanometers)
+            let resolution_name = md.get("resolution_format_name").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
             let mut pixel_pitch = match self.model.as_deref() {
                 Some("KOMODO 6K")       => Some((4400, 4400)),
                 Some("V-RAPTOR 8K VV")  => Some((5000, 5000)),
                 Some("V-RAPTOR 8K S35") => Some((3200, 3200)),
                 Some("Raven")           => Some((5000, 5000)),
                 Some("DSMC2 DRAGON-X 6K S35") => Some((5000, 5000)),
+                Some("WEAPON") if resolution_name.starts_with("6K") => Some((5000, 5000)),
                 _ => None
             };
+            let mut unit_pixel_focal_length = None;
 
             // Try camera_db for model lookup and pixel_pitch fallback
             if let Some(raw_model) = self.model.clone() {
@@ -501,8 +504,7 @@ impl RedR3d {
                                     model_data.sw as f64
                                 };
                                 if effective_sw > 0.0 && res_w > 0 {
-                                    let unit_px_fl = res_w as f64 / effective_sw;
-                                    util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit_px_fl, vec![]), &options);
+                                    unit_pixel_focal_length = Some(res_w as f64 / effective_sw);
                                 }
                             }
 
@@ -517,6 +519,17 @@ impl RedR3d {
                         }
                     }
                 }
+            }
+
+            if unit_pixel_focal_length.is_none() {
+                if let Some((pixel_pitch_x, _)) = pixel_pitch {
+                    if pixel_pitch_x > 0 {
+                        unit_pixel_focal_length = Some(1_000_000.0 / pixel_pitch_x as f64);
+                    }
+                }
+            }
+            if let Some(unit_px_fl) = unit_pixel_focal_length {
+                util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit_px_fl, vec![]), &options);
             }
 
             if let Some(pp) = pixel_pitch {
