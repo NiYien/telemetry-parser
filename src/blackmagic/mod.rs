@@ -205,6 +205,27 @@ impl BlackmagicBraw {
             }
         }
 
+        // Fallback: if no Custom("unit_pixel_focal_length") was emitted but
+        // PixelPitch is present (e.g. Pocket Cinema 4K/6K/6K G2 / Micro Studio
+        // 4K G2 with no camera_db entry), derive upfl = 1e6 / px_nm so manual
+        // focal length downstream still produces a valid camera_matrix. Mirrors
+        // RED's fallback in red/mod.rs.
+        let upfl_already_set = map
+            .get(&GroupId::Lens)
+            .map_or(false, |m| m.contains_key(&TagId::Custom("unit_pixel_focal_length".into())));
+        if !upfl_already_set {
+            if let Some(pp) = map
+                .get(&GroupId::Imager)
+                .and_then(|m| m.get_t(TagId::PixelPitch) as Option<&(u32, u32)>)
+                .copied()
+            {
+                if pp.0 > 0 {
+                    let unit_px_fl = 1_000_000.0_f64 / pp.0 as f64;
+                    util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit_px_fl, vec![]), &options);
+                }
+            }
+        }
+
         let _ = util::get_track_samples(stream, size, mp4parse::TrackType::Video, true, Some(8192), |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
             if size > 0 {
                 progress_cb(file_position as f64 / size as f64 / 3.0);
@@ -513,6 +534,25 @@ impl BlackmagicBraw {
                             self.frame_readout_time = Some(rt);
                         }
                     }
+                }
+            }
+        }
+
+        // Fallback (mirrors RED): if camera_db didn't supply
+        // unit_pixel_focal_length but a hardcoded PixelPitch was injected
+        // earlier, derive upfl = 1e6 / px_nm.
+        let upfl_already_set = map
+            .get(&GroupId::Lens)
+            .map_or(false, |m| m.contains_key(&TagId::Custom("unit_pixel_focal_length".into())));
+        if !upfl_already_set {
+            if let Some(pp) = map
+                .get(&GroupId::Imager)
+                .and_then(|m| m.get_t(TagId::PixelPitch) as Option<&(u32, u32)>)
+                .copied()
+            {
+                if pp.0 > 0 {
+                    let unit_px_fl = 1_000_000.0_f64 / pp.0 as f64;
+                    util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit_px_fl, vec![]), &options);
                 }
             }
         }

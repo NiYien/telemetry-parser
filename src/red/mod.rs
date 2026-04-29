@@ -471,6 +471,19 @@ impl RedR3d {
                 Some("Raven")           => Some((5000, 5000)),
                 Some("DSMC2 DRAGON-X 6K S35") => Some((5000, 5000)),
                 Some("WEAPON") if resolution_name.starts_with("6K") => Some((5000, 5000)),
+                // WEAPON variants whose camera_model is not the bare "WEAPON" string
+                // (e.g. "WEAPON DRAGON 6K S35", "WEAPON 6K", DSMC1 originals). All WEAPON
+                // 6K-class sensors share the 5um pitch. We intentionally do NOT match
+                // HELIUM 8K (3.65um) or MONSTRO 8K VV (5um but covered by V-RAPTOR
+                // entries) since neither contains "6K" nor "DRAGON" in their model name.
+                Some(m)
+                    if m.starts_with("WEAPON")
+                        && (resolution_name.starts_with("6K")
+                            || m.contains("6K")
+                            || m.contains("DRAGON")) =>
+                {
+                    Some((5000, 5000))
+                }
                 _ => None
             };
             let mut unit_pixel_focal_length = None;
