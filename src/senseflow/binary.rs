@@ -5,6 +5,15 @@ use crate::*;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use std::io::*;
 
+const HEADER_BYTES: u64 = 512;
+const FRAME_BYTES: u64 = 16;
+const PHYSICAL_SLOTS_PER_IMU_MS: f64 = 1001.0 / 1000.0;
+
+fn imu_time_ms_to_file_pos(timestamp_ms: f64) -> u64 {
+    let slot = (timestamp_ms.max(0.0) * PHYSICAL_SLOTS_PER_IMU_MS + 1e-6).floor() as u64;
+    HEADER_BYTES + slot * FRAME_BYTES
+}
+
 pub fn parse<T: Read + Seek>(stream: &mut T, size: usize, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
     let mut stream = std::io::BufReader::new(stream);
 
@@ -73,7 +82,11 @@ pub fn parse<T: Read + Seek>(stream: &mut T, size: usize, options: crate::InputO
 
     // ── header_only mode: return metadata without parsing any IMU frames ──
     if options.header_only {
-        let duration_ms = if size > 512 { (size - 512) as f64 / 16.0 } else { 0.0 };
+        let duration_ms = if size > HEADER_BYTES as usize {
+            (size - HEADER_BYTES as usize) as f64 / FRAME_BYTES as f64 / PHYSICAL_SLOTS_PER_IMU_MS
+        } else {
+            0.0
+        };
         let metadata = serde_json::json!({
             "brand": brand,
             "version": version,
@@ -110,22 +123,19 @@ pub fn parse<T: Read + Seek>(stream: &mut T, size: usize, options: crate::InputO
     }
 
     // ── Determine seek range for time_range_ms mode ──
-    let bytes_per_ms = 16.0f64;
-    let (seek_start, imu_start_ms, end_pos) = if let Some((start_ms, end_ms)) = options.time_range_ms {
+    let (seek_start, seek_timestamp_ms, imu_start_ms, end_pos) = if let Some((start_ms, end_ms)) = options.time_range_ms {
         // Seek 1 second earlier to scan for lens frames
         let lens_scan_start_ms = (start_ms - 1000.0).max(0.0);
-        let seek_pos = 512u64 + ((lens_scan_start_ms * bytes_per_ms) as u64 / 16) * 16;
-        let end = 512u64 + (end_ms * bytes_per_ms) as u64;
-        (Some(seek_pos), Some(start_ms), Some(end))
+        let seek_pos = imu_time_ms_to_file_pos(lens_scan_start_ms);
+        let end = imu_time_ms_to_file_pos(end_ms);
+        (Some(seek_pos), Some(lens_scan_start_ms), Some(start_ms), Some(end))
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     if let Some(pos) = seek_start {
         stream.seek(SeekFrom::Start(pos))?;
-        // Set timestamp based on seek position
-        let seeked_ms = (pos - 512) as f64 / bytes_per_ms;
-        last_timestamp = seeked_ms / 1000.0 - timestamp_step;
+        last_timestamp = seek_timestamp_ms.unwrap_or_default() / 1000.0 - timestamp_step;
     } else {
         last_timestamp = first_timestamp - timestamp_step;
     }
@@ -307,5 +317,140 @@ fn checksum<T: Read + Seek>(stream: &mut T, item_size: u64) -> Result<Cursor<Vec
     } else {
         log::error!("Invalid checksum! {} != {} | {}", calculated_sum, sum, crate::util::to_hex(&buf));
         Err(Error::from(ErrorKind::InvalidData))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tags_impl::{GetWithType, GroupId, TagId, TimeVector3};
+    use std::io::Cursor;
+
+    fn put_u16(buf: &mut [u8], offset: usize, value: u16) {
+        buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_i32(buf: &mut [u8], offset: usize, value: i32) {
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(buf: &mut [u8], offset: usize, value: u32) {
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn imu_frame(slot: usize) -> [u8; 16] {
+        let mut frame = [0u8; 16];
+        frame[0] = 0xaa;
+        frame[1] = 0x55;
+        frame[2] = 0b0000_0011;
+        frame[9..11].copy_from_slice(&(slot as i16).to_le_bytes());
+        frame[15] = frame[3..15].iter().fold(0u8, |sum, value| sum.wrapping_add(*value));
+        frame
+    }
+
+    fn lens_frame() -> [u8; 16] {
+        let mut frame = [0u8; 16];
+        frame[0] = 0x55;
+        frame[1] = 0xaa;
+        frame[2] = 0b0100_0000;
+        frame[12] = 2;
+        frame[13] = 0x01;
+        frame[14] = 0x2c;
+        frame
+    }
+
+    fn senseflow_mix_file(slot_count: usize) -> Vec<u8> {
+        let mut data = vec![0u8; 512];
+        data[0..9].copy_from_slice(b"SenseFlow");
+        data[12..16].copy_from_slice(b"0001");
+        data[60..64].copy_from_slice(b"XYZ ");
+        data[64] = 26;
+        data[65] = 1;
+        data[66] = 1;
+        data[76..80].copy_from_slice(&1.0f32.to_le_bytes());
+        put_u32(&mut data, 92, 1000);
+
+        put_u16(&mut data, 144, 1000);
+        put_u16(&mut data, 146, 0);
+        put_i32(&mut data, 148, 0);
+        put_u32(&mut data, 152, 32768);
+        put_u16(&mut data, 156, 1000);
+        put_u16(&mut data, 158, 0);
+        put_i32(&mut data, 160, 0);
+        put_u32(&mut data, 164, 32768);
+        put_u16(&mut data, 168, 1000);
+        put_u16(&mut data, 170, 0);
+        put_i32(&mut data, 172, 0);
+        put_u32(&mut data, 176, 32768);
+
+        for slot in 0..slot_count {
+            let frame = if slot >= 64 && (slot - 64) % 1001 == 0 {
+                lens_frame()
+            } else {
+                imu_frame(slot)
+            };
+            data.extend_from_slice(&frame);
+        }
+        data
+    }
+
+    fn gyro_data(samples: &[SampleInfo]) -> &Vec<TimeVector3<f64>> {
+        samples[0]
+            .tag_map
+            .as_ref()
+            .unwrap()
+            .get(&GroupId::Gyroscope)
+            .unwrap()
+            .get_t(TagId::Data)
+            .unwrap()
+    }
+
+    #[test]
+    fn time_range_seek_accounts_for_lens_slots_before_seek_start() {
+        let data = senseflow_mix_file(5030);
+        let mut stream = Cursor::new(data.clone());
+        let samples = parse(
+            &mut stream,
+            data.len(),
+            crate::InputOptions {
+                time_range_ms: Some((5000.0, 5003.0)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let gyro = gyro_data(&samples);
+
+        assert!(!gyro.is_empty());
+        let first_requested = gyro
+            .iter()
+            .find(|sample| (sample.t - 5.0).abs() < 1e-9)
+            .expect("requested timestamp was not parsed");
+        assert!(
+            (first_requested.x - 5005.0).abs() < 1e-9,
+            "5000ms should read physical slot 5005, got gyro x from slot {}",
+            first_requested.x
+        );
+    }
+
+    #[test]
+    fn header_only_duration_uses_logical_imu_time() {
+        let data = senseflow_mix_file(1001);
+        let mut stream = Cursor::new(data.clone());
+        let samples = parse(
+            &mut stream,
+            data.len(),
+            crate::InputOptions {
+                header_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(samples.len(), 1);
+        assert!(
+            (samples[0].duration_ms - 1000.0).abs() < 1e-9,
+            "header_only duration should exclude lens slots, got {}ms",
+            samples[0].duration_ms
+        );
     }
 }
