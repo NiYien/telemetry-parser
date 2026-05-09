@@ -10,6 +10,10 @@ use crate::tags_impl::*;
 use memchr::memmem;
 
 
+const NIKON_FRAME_PROBE_SAMPLE_WINDOW: usize = 8;
+const NIKON_FRAME_PROBE_SAMPLE_READ_SIZE: usize = 4096;
+const NIKON_FRAME_SAMPLE_READ_SIZE: usize = 4096;
+
 #[derive(Default)]
 pub struct Nikon {
     pub model: Option<String>,
@@ -38,6 +42,49 @@ impl Nikon {
     }
     pub fn normalize_imu_orientation(v: String) -> String {
         v
+    }
+
+    fn has_usable_frame_lens_metadata(map: &GroupedTagMap) -> bool {
+        let Some(lens) = map.get(&GroupId::Lens) else { return false; };
+
+        if let Some(v) = lens.get_t(TagId::FocalLength) as Option<&f32> {
+            if *v > 5.0 { return true; }
+        }
+        if let Some(v) = lens.get_t(TagId::PixelFocalLength) as Option<&f32> {
+            if *v > 0.0 { return true; }
+        }
+        if let Some(v) = lens.get_t(TagId::DisplayName) as Option<&String> {
+            if !v.trim().is_empty() { return true; }
+        }
+        if let Some(v) = lens.get_t(TagId::Name) as Option<&String> {
+            if !v.trim().is_empty() { return true; }
+        }
+        if let Some(v) = lens.get_t(TagId::FocusDistance) as Option<&f32> {
+            if *v > 0.0 { return true; }
+        }
+        if let Some(v) = lens.get_t(TagId::IrisFStop) as Option<&f32> {
+            if *v > 0.0 { return true; }
+        }
+        if let Some(v) = lens.get_t(TagId::IrisTStop) as Option<&f32> {
+            if *v > 0.0 { return true; }
+        }
+        false
+    }
+
+    fn probe_frame_lens_metadata<T: Read + Seek>(&self, stream: &mut T, size: usize, cancel_flag: Arc<AtomicBool>, options: &crate::InputOptions) -> Result<bool> {
+        let mut has_usable_metadata = false;
+        let read_options = util::TrackSampleReadOptions {
+            user_stride: Some(1),
+            max_sample_size: Some(NIKON_FRAME_PROBE_SAMPLE_READ_SIZE),
+            max_samples: Some(NIKON_FRAME_PROBE_SAMPLE_WINDOW),
+        };
+        let _ = util::get_track_samples_strided_with_options(stream, size, mp4parse::TrackType::Video, true, read_options, |_info: SampleInfo, data: &[u8], _file_position: u64, _video_md: Option<&VideoMetadata>| {
+            let mut map = GroupedTagMap::new();
+            if data.len() > 8 && self.parse_nev_frame_metadata(data, &mut map, options).is_ok() && Self::has_usable_frame_lens_metadata(&map) {
+                has_usable_metadata = true;
+            }
+        }, cancel_flag)?;
+        Ok(has_usable_metadata)
     }
 
     pub fn detect<P: AsRef<std::path::Path>>(buffer: &[u8], filepath: P, _options: &crate::InputOptions) -> Option<Self> {
@@ -84,26 +131,30 @@ impl Nikon {
             }
         }
         stream.seek(SeekFrom::Start(0))?;
+        let has_usable_frame_lens_metadata = self.probe_frame_lens_metadata(stream, size, cancel_flag.clone(), &options)?;
+        stream.seek(SeekFrom::Start(0))?;
 
-        // NEV frames are ~3.3MB each but metadata (NRFH) is in the first ~1KB.
-        // Limit read size to avoid loading full RAW pixel data for every frame.
-        // Sparse-sample at InputOptions::metadata_sample_stride (default = fps/10).
-        // Trade-off: stride > 1 reduces HDD seek count proportionally but lowers
-        // IMU temporal resolution. Use stride = 1 for full per-frame metadata.
-        let frame_count = std::cell::Cell::new(0u64);
-        let _strided_result = util::get_track_samples_strided(stream, size, mp4parse::TrackType::Video, true, options.metadata_sample_stride, Some(4096), |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
-            frame_count.set(frame_count.get() + 1);
-            if size > 0 {
-                progress_cb(file_position as f64 / size as f64);
-            }
+        if has_usable_frame_lens_metadata {
+            // NEV frames are ~3.3MB each but metadata (NRFH) is in the first ~1KB.
+            // Limit read size to avoid loading full RAW pixel data for every frame.
+            // Sparse-sample at InputOptions::metadata_sample_stride (default = fps/10).
+            // Trade-off: stride > 1 reduces HDD seek count proportionally but lowers
+            // IMU temporal resolution. Use stride = 1 for full per-frame metadata.
+            let frame_count = std::cell::Cell::new(0u64);
+            let _strided_result = util::get_track_samples_strided(stream, size, mp4parse::TrackType::Video, true, options.metadata_sample_stride, Some(NIKON_FRAME_SAMPLE_READ_SIZE), |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
+                frame_count.set(frame_count.get() + 1);
+                if size > 0 {
+                    progress_cb(file_position as f64 / size as f64);
+                }
 
-            if data.len() > 8 {
-                let mut map = if info.sample_index == 0 { first_map.clone() } else { GroupedTagMap::new() };
-                self.parse_nev_frame_metadata(&data, &mut map, &options).unwrap();
-                info.tag_map = Some(map);
-                samples.push(info);
-            }
-        }, cancel_flag)?;
+                if data.len() > 8 {
+                    let mut map = if info.sample_index == 0 { first_map.clone() } else { GroupedTagMap::new() };
+                    self.parse_nev_frame_metadata(&data, &mut map, &options).unwrap();
+                    info.tag_map = Some(map);
+                    samples.push(info);
+                }
+            }, cancel_flag)?;
+        }
 
         if samples.is_empty() && !first_map.is_empty() {
             samples.push(SampleInfo {
@@ -790,6 +841,282 @@ impl Nikon {
             } else if let Some(ref mvhd_time) = self.mvhd_creation_time {
                 util::write_creation_date_tags(map, mvhd_time, None, Some("500"), options);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn insert_focal_length(map: &mut GroupedTagMap, value: f32) {
+        util::insert_tag(
+            map,
+            tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{:.1} mm", v), value, vec![]),
+            &crate::InputOptions::default(),
+        );
+    }
+
+    fn insert_lens_name(map: &mut GroupedTagMap, value: &str) {
+        util::insert_tag(
+            map,
+            tag!(parsed GroupId::Lens, TagId::DisplayName, "Lens name", String, |v| v.clone(), value.to_string(), vec![]),
+            &crate::InputOptions::default(),
+        );
+    }
+
+    fn nraw_frame_with_focal_length(value: f32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&8u32.to_be_bytes());
+        data.extend_from_slice(b"NRAW");
+        data.extend_from_slice(&8u32.to_be_bytes());
+        data.extend_from_slice(b"NRFH");
+        data.extend_from_slice(&17u32.to_be_bytes());
+        data.extend_from_slice(b"NRMT");
+        data.extend_from_slice(&0x0110_920Au32.to_be_bytes());
+        data.push(0);
+        data.extend_from_slice(&value.to_be_bytes());
+        data
+    }
+
+    fn clip_metadata_with_focal_length(value: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x0110_920Au32.to_be_bytes());
+        data.extend_from_slice(&5u16.to_be_bytes());
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.extend_from_slice(&value.to_be_bytes());
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data
+    }
+
+    fn push_u32(data: &mut Vec<u8>, value: u32) {
+        data.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn mp4_box(name: &[u8; 4], payload: Vec<u8>) -> Vec<u8> {
+        let mut data = Vec::with_capacity(payload.len() + 8);
+        push_u32(&mut data, (payload.len() + 8) as u32);
+        data.extend_from_slice(name);
+        data.extend_from_slice(&payload);
+        data
+    }
+
+    fn full_box(name: &[u8; 4], payload: Vec<u8>) -> Vec<u8> {
+        let mut data = Vec::with_capacity(payload.len() + 4);
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        data.extend_from_slice(&payload);
+        mp4_box(name, data)
+    }
+
+    fn mvhd_box(sample_count: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0; 8]);
+        push_u32(&mut payload, 1000);
+        push_u32(&mut payload, (sample_count as u32) * 1000);
+        payload.extend_from_slice(&[0; 80]);
+        full_box(b"mvhd", payload)
+    }
+
+    fn mdhd_box(sample_count: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0; 8]);
+        push_u32(&mut payload, 1000);
+        push_u32(&mut payload, (sample_count as u32) * 1000);
+        payload.extend_from_slice(&[0; 4]);
+        full_box(b"mdhd", payload)
+    }
+
+    fn hdlr_box() -> Vec<u8> {
+        let mut payload = Vec::new();
+        push_u32(&mut payload, 0);
+        payload.extend_from_slice(b"vide");
+        payload.extend_from_slice(&[0; 12]);
+        payload.extend_from_slice(b"VideoHandler\0");
+        full_box(b"hdlr", payload)
+    }
+
+    fn stts_box(sample_count: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        push_u32(&mut payload, 1);
+        push_u32(&mut payload, sample_count as u32);
+        push_u32(&mut payload, 1000);
+        full_box(b"stts", payload)
+    }
+
+    fn stsc_box(sample_count: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        push_u32(&mut payload, 1);
+        push_u32(&mut payload, 1);
+        push_u32(&mut payload, sample_count as u32);
+        push_u32(&mut payload, 1);
+        full_box(b"stsc", payload)
+    }
+
+    fn stsz_box(samples: &[Vec<u8>]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        push_u32(&mut payload, 0);
+        push_u32(&mut payload, samples.len() as u32);
+        for sample in samples {
+            push_u32(&mut payload, sample.len() as u32);
+        }
+        full_box(b"stsz", payload)
+    }
+
+    fn stco_box(first_sample_offset: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        push_u32(&mut payload, 1);
+        push_u32(&mut payload, first_sample_offset);
+        full_box(b"stco", payload)
+    }
+
+    fn moov_box(first_sample_offset: u32, samples: &[Vec<u8>], clip_payload: Option<Vec<u8>>) -> Vec<u8> {
+        let sample_count = samples.len();
+        let stbl = mp4_box(b"stbl", [stts_box(sample_count), stsc_box(sample_count), stsz_box(samples), stco_box(first_sample_offset)].concat());
+        let minf = mp4_box(b"minf", stbl);
+        let mdia = mp4_box(b"mdia", [mdhd_box(sample_count), hdlr_box(), minf].concat());
+        let trak = mp4_box(b"trak", mdia);
+        let udta = clip_payload.map(|payload| mp4_box(b"udta", mp4_box(b"NCDT", payload))).unwrap_or_default();
+        mp4_box(b"moov", [mvhd_box(sample_count), udta, trak].concat())
+    }
+
+    fn synthetic_nikon_mp4(samples: Vec<Vec<u8>>, clip_metadata: Option<Vec<u8>>) -> Vec<u8> {
+        let ftyp = mp4_box(b"ftyp", {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(b"isom");
+            push_u32(&mut payload, 0);
+            payload.extend_from_slice(b"isom");
+            payload
+        });
+        let clip_payload = clip_metadata.map(|metadata| {
+            let mut payload = vec![0; 26];
+            payload.extend_from_slice(&metadata);
+            payload
+        });
+        let moov_without_offsets = moov_box(0, &samples, clip_payload.clone());
+        let first_sample_offset = (ftyp.len() + moov_without_offsets.len() + 8) as u32;
+        let moov = moov_box(first_sample_offset, &samples, clip_payload);
+        let mdat = mp4_box(b"mdat", samples.concat());
+        [ftyp, moov, mdat].concat()
+    }
+
+    #[test]
+    fn frame_lens_metadata_classifier_accepts_valid_focal_length() {
+        let mut map = GroupedTagMap::new();
+        insert_focal_length(&mut map, 35.0);
+
+        assert!(Nikon::has_usable_frame_lens_metadata(&map));
+    }
+
+    #[test]
+    fn frame_lens_metadata_classifier_rejects_invalid_focal_length() {
+        let mut map = GroupedTagMap::new();
+        insert_focal_length(&mut map, 5.0);
+
+        assert!(!Nikon::has_usable_frame_lens_metadata(&map));
+    }
+
+    #[test]
+    fn frame_lens_metadata_classifier_accepts_non_focal_lens_tags() {
+        let mut map = GroupedTagMap::new();
+        insert_lens_name(&mut map, "NIKKOR Z");
+
+        assert!(Nikon::has_usable_frame_lens_metadata(&map));
+    }
+
+    #[test]
+    fn clip_level_focal_length_alone_does_not_satisfy_frame_probe() {
+        let mut nikon = Nikon::default();
+        let mut clip_map = GroupedTagMap::new();
+        nikon
+            .parse_nev_clip_metadata(
+                &clip_metadata_with_focal_length(35),
+                &mut clip_map,
+                &crate::InputOptions::default(),
+            )
+            .unwrap();
+
+        let mut probe_map = GroupedTagMap::new();
+        nikon
+            .parse_nev_frame_metadata(&nraw_frame_with_focal_length(5.0), &mut probe_map, &crate::InputOptions::default())
+            .unwrap();
+
+        assert!(clip_map
+            .get(&GroupId::Lens)
+            .and_then(|m| m.get_t(TagId::FocalLength) as Option<&f32>)
+            .is_some());
+        assert!(!Nikon::has_usable_frame_lens_metadata(&probe_map));
+    }
+
+    #[test]
+    fn frame_level_focal_length_satisfies_frame_probe() {
+        let nikon = Nikon::default();
+        let mut probe_map = GroupedTagMap::new();
+        nikon
+            .parse_nev_frame_metadata(&nraw_frame_with_focal_length(35.0), &mut probe_map, &crate::InputOptions::default())
+            .unwrap();
+
+        assert!(Nikon::has_usable_frame_lens_metadata(&probe_map));
+    }
+
+    #[test]
+    fn parse_clip_only_samples_skips_full_video_sample_traversal_and_preserves_clip_metadata() {
+        let samples = vec![
+            nraw_frame_with_focal_length(5.0),
+            nraw_frame_with_focal_length(5.0),
+            nraw_frame_with_focal_length(5.0),
+        ];
+        let data = synthetic_nikon_mp4(samples, Some(clip_metadata_with_focal_length(35)));
+        let mut stream = Cursor::new(data.clone());
+        let mut nikon = Nikon::default();
+
+        let parsed = nikon.parse(&mut stream, data.len(), |_| {}, Arc::new(AtomicBool::new(false)), crate::InputOptions::default()).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0]
+            .tag_map
+            .as_ref()
+            .and_then(|m| m.get(&GroupId::Lens))
+            .and_then(|m| m.get_t(TagId::FocalLength) as Option<&f32>)
+            .is_some());
+    }
+
+    #[test]
+    fn parse_frame_level_lens_metadata_continues_full_video_sample_traversal() {
+        let samples = vec![
+            nraw_frame_with_focal_length(35.0),
+            nraw_frame_with_focal_length(36.0),
+            nraw_frame_with_focal_length(37.0),
+        ];
+        let data = synthetic_nikon_mp4(samples, Some(clip_metadata_with_focal_length(35)));
+        let mut stream = Cursor::new(data.clone());
+        let mut nikon = Nikon::default();
+
+        let parsed = nikon.parse(&mut stream, data.len(), |_| {}, Arc::new(AtomicBool::new(false)), crate::InputOptions::default()).unwrap();
+
+        assert_eq!(parsed.len(), 3);
+        assert!(parsed.iter().all(|sample| sample
+            .tag_map
+            .as_ref()
+            .and_then(|m| m.get(&GroupId::Lens))
+            .and_then(|m| m.get_t(TagId::FocalLength) as Option<&f32>)
+            .is_some()));
+    }
+
+    #[test]
+    fn shared_nikon_extensions_are_detected() {
+        let extensions = Nikon::possible_extensions();
+
+        assert_eq!(extensions, vec!["mp4", "mov", "nev", "r3d"]);
+
+        for ext in extensions {
+            let filename = format!("clip.{ext}");
+            let detected = Nikon::detect(
+                b"Nikon\0NCTG",
+                std::path::Path::new(&filename),
+                &crate::InputOptions::default(),
+            );
+
+            assert!(detected.is_some(), "{ext} should use Nikon detection");
         }
     }
 }

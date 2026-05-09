@@ -424,6 +424,13 @@ pub fn get_other_track_samples<F, T: Read + Seek>(stream: &mut T, size: usize, s
     get_track_samples(stream, size, mp4parse::TrackType::Unknown, single, None, callback, cancel_flag)
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrackSampleReadOptions {
+    pub user_stride: Option<usize>,
+    pub max_sample_size: Option<usize>,
+    pub max_samples: Option<usize>,
+}
+
 /// Variant of get_track_samples with sparse sampling stride support.
 ///
 /// Skips non-strided samples to reduce HDD seek count. Returns
@@ -437,10 +444,36 @@ pub fn get_other_track_samples<F, T: Read + Seek>(stream: &mut T, size: usize, s
 pub fn get_track_samples_strided<F, T: Read + Seek>(
     stream: &mut T,
     size: usize,
-    mut typ: mp4parse::TrackType,
+    typ: mp4parse::TrackType,
     single: bool,
     user_stride: Option<usize>,
     max_sample_size: Option<usize>,
+    callback: F,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<(MediaContext, u64, usize)>
+    where F: FnMut(SampleInfo, &[u8], u64, Option<&VideoMetadata>)
+{
+    get_track_samples_strided_with_options(
+        stream,
+        size,
+        typ,
+        single,
+        TrackSampleReadOptions {
+            user_stride,
+            max_sample_size,
+            max_samples: None,
+        },
+        callback,
+        cancel_flag,
+    )
+}
+
+pub fn get_track_samples_strided_with_options<F, T: Read + Seek>(
+    stream: &mut T,
+    size: usize,
+    mut typ: mp4parse::TrackType,
+    single: bool,
+    options: TrackSampleReadOptions,
     mut callback: F,
     cancel_flag: Arc<AtomicBool>,
 ) -> Result<(MediaContext, u64, usize)>
@@ -463,7 +496,7 @@ pub fn get_track_samples_strided<F, T: Read + Seek>(
         .and_then(|t| get_video_metadata_from_track(t).ok())
         .map(|vmd| vmd.fps)
         .unwrap_or(0.0);
-    let stride = resolve_sample_stride(user_stride, fps);
+    let stride = resolve_sample_stride(options.user_stride, fps);
     let used_stride: usize = stride;
 
     for x in &ctx.tracks {
@@ -479,12 +512,15 @@ pub fn get_track_samples_strided<F, T: Read + Seek>(
                     let mut emit_index = 0u64; // index of emitted (strided) sample
                     for s in samples {
                         if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                        if let Some(max_samples) = options.max_samples {
+                            if emit_index as usize >= max_samples { break; }
+                        }
 
                         // Apply stride: skip non-strided frames entirely (no seek, no read)
                         let is_strided = stride <= 1 || (sample_index as usize) % stride == 0;
 
                         let mut sample_size = (s.end_offset.0 - s.start_offset.0) as usize;
-                        if let Some(max_sample_size) = max_sample_size {
+                        if let Some(max_sample_size) = options.max_sample_size {
                             if sample_size > max_sample_size {
                                 sample_size = max_sample_size;
                             }
@@ -535,6 +571,80 @@ pub fn get_metadata_track_samples_strided<F, T: Read + Seek>(
     where F: FnMut(SampleInfo, &[u8], u64, Option<&VideoMetadata>)
 {
     get_track_samples_strided(stream, size, mp4parse::TrackType::Metadata, single, user_stride, None, callback, cancel_flag)
+}
+
+#[cfg(test)]
+fn for_each_synthetic_track_sample<F>(
+    samples: &[Vec<u8>],
+    options: TrackSampleReadOptions,
+    cancel_flag: Arc<AtomicBool>,
+    mut callback: F,
+)
+    where F: FnMut(SampleInfo, &[u8])
+{
+    let stride = resolve_sample_stride(options.user_stride, 0.0);
+    let mut sample_index = 0u64;
+    let mut emit_index = 0u64;
+
+    for data in samples {
+        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) { break; }
+        if let Some(max_samples) = options.max_samples {
+            if emit_index as usize >= max_samples { break; }
+        }
+
+        let is_strided = stride <= 1 || (sample_index as usize) % stride == 0;
+        let sample_size = options.max_sample_size.map(|v| data.len().min(v)).unwrap_or(data.len());
+        if sample_size > 4 {
+            if is_strided {
+                callback(SampleInfo { sample_index: emit_index, ..Default::default() }, &data[..sample_size]);
+                emit_index += 1;
+            }
+            sample_index += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_sample_limit_does_not_use_cancel_flag() {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let options = TrackSampleReadOptions {
+            user_stride: Some(1),
+            max_sample_size: None,
+            max_samples: Some(2),
+        };
+        let samples = vec![
+            vec![1, 2, 3, 4, 5],
+            vec![6, 7, 8, 9, 10],
+            vec![11, 12, 13, 14, 15],
+        ];
+        let mut visited = 0;
+
+        for_each_synthetic_track_sample(&samples, options, cancel_flag.clone(), |_info, _data| {
+            visited += 1;
+        });
+
+        assert_eq!(visited, 2);
+        assert!(!cancel_flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn unbounded_sample_options_visit_all_samples() {
+        let options = TrackSampleReadOptions {
+            user_stride: Some(1),
+            max_sample_size: None,
+            max_samples: None,
+        };
+        let samples = vec![vec![0; 5], vec![0; 5], vec![0; 5]];
+        let mut visited = 0;
+
+        for_each_synthetic_track_sample(&samples, options, Arc::new(AtomicBool::new(false)), |_info, _data| visited += 1);
+
+        assert_eq!(visited, 3);
+    }
 }
 
 pub fn read_beginning_and_end<T: Read + Seek>(stream: &mut T, stream_size: usize, read_size: usize) -> Result<Vec<u8>> {
