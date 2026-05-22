@@ -282,6 +282,30 @@ impl Canon {
             }
         }
 
+        // EXIF model fallback for Canon bodies whose CNDM samples omit tag 0xe228
+        // (e.g. R5 Mark II — `samples[0].tag_map` exists for IMU data but carries no Name).
+        // Without this fallback the original `!has_tag_map` branch below skips, leaving
+        // `self.model = None` and breaking downstream camera_db lookup.
+        if self.model.is_none() {
+            if let Some(exif) = exif_data.as_ref() {
+                if let Some(raw_model) = exif.model.as_deref() {
+                    let trimmed = raw_model.trim_end_matches(|c: char| c.is_whitespace() || c == '\0');
+                    if !trimmed.is_empty() {
+                        let model_clean = trimmed.strip_prefix("Canon ").unwrap_or(trimmed).to_string();
+                        log::info!("Canon: model recovered from EXIF tag 0x0110: {:?} -> {:?}", raw_model, model_clean);
+                        if let Some(ref mut map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
+                            util::insert_tag(
+                                map,
+                                tag!(parsed GroupId::Default, TagId::Name, "Camera model", String, |v| v.to_string(), model_clean.clone(), Vec::new()),
+                                options,
+                            );
+                        }
+                        self.model = Some(model_clean);
+                    }
+                }
+            }
+        }
+
         // Supplement from UUID EXIF when CNDM data is missing
         if let Some(exif) = &exif_data {
             // If no samples (no CNDM track) or first sample has no tag_map, create one from EXIF
