@@ -17,6 +17,8 @@ pub struct BlackmagicBraw {
     is_braw: bool,
     /// For Video Assist BRAW: the original manufacturer (e.g. "Panasonic")
     original_manufacturer: Option<String>,
+    /// Container-level creation time from mvhd ("yyyy:MM:dd HH:mm:ss", UTC), if present
+    creation_date: Option<String>,
 }
 
 impl BlackmagicBraw {
@@ -173,6 +175,13 @@ impl BlackmagicBraw {
             }
 
             util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::Metadata, "Metadata", Json, |v| serde_json::to_string(v).unwrap(), meta, vec![]), &options);
+        }
+
+        // Emit unified creation-date tags from the container mvhd time (UTC).
+        // BRAW has no timezone field, so write as UTC (tz=None) -> CreationDate == CreationDateUtc,
+        // matching the Canon mvhd-fallback semantics. No subsec: mvhd is whole-second precision.
+        if let Some(ref creation) = self.creation_date {
+            util::write_creation_date_tags(&mut map, creation, None, None, &options);
         }
 
         // camera_db integration for BRAW path (skip for Video Assist non-BMD cameras)
@@ -608,6 +617,9 @@ impl BlackmagicBraw {
 
     pub fn parse_meta<T: Read + Seek>(&mut self, stream: &mut T, size: usize) -> Result<serde_json::Value> {
         let all = read_beginning_and_end(stream, size, 4*1024*1024)?;
+        // Container creation time from mvhd (UTC; BRAW carries no timezone field).
+        // Captured from the same buffer here; parse() consumes it to emit CreationDate tags.
+        self.creation_date = util::extract_mvhd_creation_time(&all);
         let mut offs = 0;
         let mut meta = None;
         while let Some(pos) = memchr::memmem::find(&all[offs..], b"meta") {
