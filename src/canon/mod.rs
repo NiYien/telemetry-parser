@@ -62,6 +62,50 @@ impl Canon {
         None
     }
 
+    /// Probe helper: returns true when a single ISOBMFF metadata sample's acquisition
+    /// block (CNDM id=2, or CRM AcquisitionMetadataPack id=0x0D) parses into a tag map
+    /// that carries gyroscope data. Read-only and best-effort: any malformed block just
+    /// returns false. Used to decide the per-frame sampling stride (full read when gyro
+    /// is present — see `parse`).
+    fn sample_has_gyro(data: &[u8], is_crm: bool, options: &crate::InputOptions) -> bool {
+        if data.len() <= 8 { return false; }
+        let mut slice = Cursor::new(data);
+        if is_crm {
+            while let Ok(length) = slice.read_u32::<LittleEndian>() {
+                if length < 8 { break; }
+                let length = (length - 8) as usize;
+                let metadata_id = match slice.read_u32::<LittleEndian>() { Ok(v) => v, Err(_) => break };
+                let pos = slice.position() as usize;
+                if pos + length > data.len() { break; }
+                let data_inner = &data[pos..pos + length];
+                if slice.seek_relative(length as i64).is_err() { break; }
+                if metadata_id == 0x0000000D { // AcquisitionMetadataPack
+                    let mut d = Cursor::new(data_inner);
+                    if d.read_u16::<LittleEndian>().is_err() { continue; } // version
+                    if d.read_u16::<LittleEndian>().is_err() { continue; } // reserved
+                    if let Ok(map) = parse_metadata(&mut d, length, options) {
+                        if map.contains_key(&GroupId::Gyroscope) { return true; }
+                    }
+                }
+            }
+        } else {
+            while let Ok(id) = slice.read_u32::<LittleEndian>() {
+                let length = match slice.read_u32::<LittleEndian>() { Ok(v) => v as usize, Err(_) => break };
+                let pos = slice.position() as usize;
+                if pos + length > data.len() { break; }
+                let data_inner = &data[pos..pos + length];
+                if slice.seek_relative(length as i64).is_err() { break; }
+                if id == 2 { // CNDM Acquisition metadata
+                    let mut d = Cursor::new(data_inner);
+                    if let Ok(map) = parse_metadata(&mut d, length, options) {
+                        if map.contains_key(&GroupId::Gyroscope) { return true; }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     pub fn parse<T: Read + Seek, F: Fn(f64)>(&mut self, stream: &mut T, size: usize, progress_cb: F, cancel_flag: Arc<AtomicBool>, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
         let mut header = [0u8; 4];
         stream.read_exact(&mut header)?;
@@ -83,11 +127,40 @@ impl Canon {
         } else {
             let mut samples = Vec::new();
             let cancel_flag2 = cancel_flag.clone();
+            let is_crm = self.is_crm;
             // Canon MOV/MP4/CRM (ISOBMFF) fast path: sparse-sample metadata track at
             // configurable stride (InputOptions::metadata_sample_stride). Default = fps/10.
-            // Trade-off: stride > 1 reduces HDD seek count but lowers IMU temporal resolution.
-            // Use stride = 1 for full per-frame metadata (preserves all gyro/accel samples).
-            let _strided_result = util::get_metadata_track_samples_strided(stream, size, true, options.metadata_sample_stride, |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
+            //
+            // Gyro caveat: Canon writes a per-frame gyro/accel burst in CNDM (0xe21f/0xe220),
+            // and normalized_imu_interpolated accumulates Canon IMU timestamps per-sample with
+            // no per-frame anchoring. A stride > 1 therefore shrinks the summed sample duration
+            // and compresses the gyro timeline to 1/stride of the clip (not merely lower density).
+            // So probe the first few metadata samples: if this clip carries gyroscope data, force
+            // stride = 1 (full per-frame, correct timeline); otherwise keep the configured sparse
+            // stride (focal-length metadata is interpolatable and keyed by real composition time).
+            let effective_stride = {
+                let mut probe_has_gyro = false;
+                const PROBE_SAMPLES: usize = 3;
+                let probe_cancel = Arc::new(AtomicBool::new(false));
+                let _ = util::get_track_samples_strided_with_options(
+                    stream,
+                    size,
+                    mp4parse::TrackType::Metadata,
+                    true,
+                    util::TrackSampleReadOptions { user_stride: Some(1), max_sample_size: None, max_samples: Some(PROBE_SAMPLES) },
+                    |_info: SampleInfo, data: &[u8], _file_position: u64, _video_md: Option<&VideoMetadata>| {
+                        if !probe_has_gyro && Self::sample_has_gyro(data, is_crm, &options) {
+                            probe_has_gyro = true;
+                        }
+                    },
+                    probe_cancel,
+                );
+                stream.seek(SeekFrom::Start(0))?;
+                log::info!("[canon] metadata stride probe: has_gyro={probe_has_gyro} configured_stride={:?} -> effective_stride={}",
+                    options.metadata_sample_stride, if probe_has_gyro { "1".to_string() } else { format!("{:?}", options.metadata_sample_stride) });
+                if probe_has_gyro { Some(1) } else { options.metadata_sample_stride }
+            };
+            let _strided_result = util::get_metadata_track_samples_strided(stream, size, true, effective_stride, |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
                 if size > 0 {
                     progress_cb(file_position as f64 / size as f64);
                 }
