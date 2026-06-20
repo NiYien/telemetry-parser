@@ -114,6 +114,18 @@ impl BlackmagicBraw {
         }
     }
 
+    /// Map a Video Assist source camera manufacturer to its camera_db brand key
+    /// (the per-brand JSON filename stem, uppercased). Panasonic cameras live in
+    /// lumix.json, so they map to "LUMIX"; every other manufacturer passes through
+    /// as its own name uppercased (e.g. "Sony" -> "SONY"). An unknown brand simply
+    /// misses in `process_model` and the caller falls back to a no-op.
+    fn source_db_brand(manufacturer: &str) -> String {
+        match manufacturer.trim().to_ascii_lowercase().as_str() {
+            "panasonic" => "LUMIX".to_string(),
+            other => other.to_uppercase(),
+        }
+    }
+
     pub fn parse<T: Read + Seek, F: Fn(f64)>(&mut self, stream: &mut T, size: usize, progress_cb: F, cancel_flag: Arc<AtomicBool>, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
         if !self.is_braw {
             return self.parse_non_braw(stream, size, progress_cb, cancel_flag, options);
@@ -125,6 +137,9 @@ impl BlackmagicBraw {
 
         let mut samples = Vec::new();
         let mut frame_rate = None;
+        // First valid per-frame focal length (35mm-equivalent for Video Assist
+        // source-camera BRAW), captured for the source-camera lens synthesis below.
+        let mut equiv_focal: Option<f32> = None;
 
         let mut firmware_version = String::new();
         // let mut crop_factor = 1.0;
@@ -250,6 +265,7 @@ impl BlackmagicBraw {
                 if let Some(v) = md.get("focal_length").and_then(|v| v.as_str()) {
                     let v = v.replace("mm", "");
                     if let Ok(v) = v.parse::<f32>() {
+                        if equiv_focal.is_none() && v > 0.0 { equiv_focal = Some(v); }
                         util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{v:.2} mm"), v, vec![]), &options);
                     }
                 }
@@ -271,6 +287,77 @@ impl BlackmagicBraw {
                 }
             }
         }
+
+        // Video Assist BRAW recorded from a NON-BMD source camera (e.g. Panasonic
+        // S1H over RAW HDMI). The real-BMD camera_db block above is skipped because
+        // `original_manufacturer` is Some(...). Synthesize lens calibration from the
+        // SOURCE camera's camera_db entry (routed by brand, e.g. Panasonic -> LUMIX)
+        // so the downstream auto-lens path can build a camera matrix.
+        //
+        // Why this is safe geometrically: BRAW is the native sensor readout, so the
+        // recorded resolution equals the captured sensor region (no downsampling),
+        // hence `scale_35mm = full_w / captured_w` is well-defined. focal is computed
+        // full-frame referenced (the BRAW focal_length is the 35mm-equivalent, so the
+        // crop cancels: fx = equiv * res_w / 36); only readout depends on the crop.
+        if let Some(mfr) = self.original_manufacturer.clone() {
+            if let Some(db_path) = &options.camera_db_path {
+                if let Ok(db) = crate::camera_db::CameraDatabase::load(db_path) {
+                    let brand = Self::source_db_brand(&mfr);
+                    let raw_name = self.model.as_deref().unwrap_or("").to_string();
+                    if let Some((model_name, model_data)) = db.process_model(&brand, &raw_name, &mut map, &options) {
+                        self.model = Some(model_name.to_string());
+                        let sensor_w = model_data.sw;
+
+                        // captured width/height = sensor_area_captured (BRAW native readout == output)
+                        let cap = map.get(&GroupId::Imager)
+                            .and_then(|m| m.get_t(TagId::CaptureAreaSize) as Option<&(f32, f32)>)
+                            .copied();
+                        let captured_w = cap.map(|v| v.0 as f64).filter(|w| *w > 0.0);
+                        let res_w = captured_w.map(|w| w.round() as u32).unwrap_or(0);
+                        let res_h = cap.map(|v| v.1.round() as u32).unwrap_or(0);
+
+                        // scale_35mm = full_w / captured_w, full_w = sqrt(pc * 1.5) (3:2 full sensor)
+                        let scale_35mm = match (captured_w, model_data.extra.get("pc").and_then(|v| v.as_u64())) {
+                            (Some(cw), Some(pc)) if pc > 0 && cw > 0.0 => Some((pc as f64 * 1.5).sqrt() / cw),
+                            _ => None,
+                        };
+                        if let Some(scale) = scale_35mm {
+                            util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{:.4}", v), scale, vec![]), &options);
+                        }
+
+                        // focal: full-frame referenced (do NOT multiply by scale_35mm)
+                        let upfl_set = map.get(&GroupId::Lens).map_or(false, |m| m.contains_key(&TagId::Custom("unit_pixel_focal_length".into())));
+                        if res_w > 0 && !upfl_set {
+                            let unit_px_fl = res_w as f64 / 36.0;
+                            util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit_px_fl, vec![]), &options);
+
+                            let pfl_set = map.get(&GroupId::Lens).map_or(false, |m| m.contains_key(&TagId::PixelFocalLength));
+                            if !pfl_set {
+                                if let Some(fl) = equiv_focal.filter(|f| *f > 5.0) {
+                                    let px_fl = fl as f64 * res_w as f64 / 36.0;
+                                    util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{:.2}", v), px_fl as f32, vec![]), &options);
+                                }
+                            }
+                        }
+
+                        // readout: crop-aware via the existing scale_sensor_norm step.
+                        // Treat Some(0.0) as unset: Video Assist BRAW reports
+                        // sensor_line_time=0, so `parse_meta` already set
+                        // frame_readout_time to Some(0.0) above — recompute it from the
+                        // source camera's readout table instead of leaving it at 0.
+                        if self.frame_readout_time.map_or(true, |v| v <= 0.0) {
+                            let tags = std::collections::HashMap::new();
+                            let s35 = scale_35mm.unwrap_or(0.0);
+                            let fps = frame_rate.unwrap_or(0.0);
+                            if let Some(rt) = db.process_readout(&brand, model_name, res_w, res_h, fps, s35, sensor_w, &tags, &mut map, &options) {
+                                self.frame_readout_time = Some(rt);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let cancel_flag2 = cancel_flag.clone();
         util::get_metadata_track_samples(stream, size, false, |info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
             if size > 0 {
