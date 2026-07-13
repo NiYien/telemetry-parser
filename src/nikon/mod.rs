@@ -25,6 +25,9 @@ pub struct Nikon {
     electronic_vr: Option<u32>,
     vibration_reduction: Option<u8>,
     is_proxy: bool,
+    nraw_width: Option<u32>,
+    nraw_height: Option<u32>,
+    is_nev: bool,
     is_r3d: bool,
 }
 impl Nikon {
@@ -92,6 +95,9 @@ impl Nikon {
             let is_r3d = filepath.as_ref().extension()
                 .map(|e| e.to_ascii_lowercase() == "r3d")
                 .unwrap_or(false);
+            let is_nev = filepath.as_ref().extension()
+                .map(|e| e.to_ascii_lowercase() == "nev")
+                .unwrap_or(false);
             return Some(Self {
                 model: None,
                 lens: None,
@@ -102,6 +108,9 @@ impl Nikon {
                 electronic_vr: None,
                 vibration_reduction: None,
                 is_proxy: false,
+                nraw_width: None,
+                nraw_height: None,
+                is_nev,
                 is_r3d,
             });
         }
@@ -296,7 +305,7 @@ impl Nikon {
                 0x0000_0003 => { md.insert("camera_firmware_version".into(), as_string().into()); }
                 0x0000_0011 => { md.insert("local_datetime".into(), as_string().into()); }
                 0x0000_0012 => { md.insert("gmt_datetime".into(), as_string().into()); }
-                0x0000_0013 => { if let Some(v) = as_u32() { md.insert("record_mode".into(), v.into()); } }
+                0x0000_0013 => { if let Some(v) = as_u32() { md.insert("frame_count".into(), v.into()); } } // LONG×2 [frame_count, 0]; matches container video frame count
                 0x0000_0014 => { if let Some(v) = as_u32() { md.insert("flip_horizontal".into(), v.into()); } }
                 0x0000_0015 => { if let Some(v) = as_u32() { md.insert("flip_vertical".into(), v.into()); } }
                 0x0000_0019 => { md.insert("timezone".into(), as_string().into()); }
@@ -440,10 +449,23 @@ impl Nikon {
                         md.insert("electronic_vr".into(), v.into());
                     }
                 }
-                0x0000_1015 => { // ProxyOutput: 0=Original, 1=Proxy
+                0x0000_1015 => { // N-RAW recording info, SHORT array: [0]=ProxyOutput (0=Original, 1=Proxy), [3]=N-RAW bit depth, [4]/[5]=N-RAW recording width/height
                     if let Some(v) = as_u32() {
                         self.is_proxy = v == 1;
                         md.insert("proxy_output".into(), v.into());
+                    }
+                    // Observed on Z 8 N-RAW proxies (Ver.03.01): SHORT×6 [1, 49, 1, 12, 4128, 2322].
+                    // Older firmwares write a single SHORT; guard on count and plausibility.
+                    if type_id == 3 && count >= 6 && value_bytes.len() >= 12 {
+                        let s = |i: usize| u16::from_be_bytes([value_bytes[i * 2], value_bytes[i * 2 + 1]]) as u32;
+                        let (w, h) = (s(4), s(5));
+                        if w >= 1280 && h >= 720 && w > h {
+                            self.nraw_width = Some(w);
+                            self.nraw_height = Some(h);
+                            md.insert("nraw_width".into(), w.into());
+                            md.insert("nraw_height".into(), h.into());
+                            md.insert("nraw_bit_depth".into(), s(3).into());
+                        }
                     }
                 }
                 _ => {
@@ -745,19 +767,31 @@ impl Nikon {
                             };
 
                             // Readout (only on first sample)
-                            // Proxy files (N-RAW proxy MP4): use sensor crop area for lookup,
-                            // because the sensor reads full crop area without line-skipping.
-                            // Non-proxy: use container resolution (reflects actual recording mode).
+                            // Resolution source priority:
+                            //   1. N-RAW recording dimensions from NCTG tag 0x1015 (proxy MP4 or NEV master)
+                            //   2. Proxy without usable 0x1015 dims: sensor crop area (legacy assumption: full-area scan)
+                            //   3. Otherwise: container resolution (reflects the actual recording mode)
+                            // The subsampled ratio is passed only for N-RAW captures — ordinary
+                            // H.264/H.265 recordings keep the plain per-mode column lookup.
                             if self.frame_readout_time.is_none() {
-                                let (readout_w, readout_h) = if self.is_proxy {
+                                let crop_h = md.get("crop_hi_speed_crop_h").and_then(|v| v.as_u64()).map(|v| v as u32);
+                                let (readout_w, readout_h) = if let (Some(nw), Some(nh)) = (self.nraw_width, self.nraw_height) {
+                                    (nw, nh)
+                                } else if self.is_proxy {
                                     let rw = md.get("crop_hi_speed_crop_w").and_then(|v| v.as_u64()).unwrap_or(resolution_w as u64) as u32;
-                                    let rh = md.get("crop_hi_speed_crop_h").and_then(|v| v.as_u64()).unwrap_or(resolution_h as u64) as u32;
+                                    let rh = crop_h.unwrap_or(resolution_h);
                                     (rw, rh)
                                 } else {
                                     (resolution_w, resolution_h)
                                 };
+                                let is_nraw_capture = self.nraw_width.is_some() || self.is_nev;
+                                let subsampled_ratio = if is_nraw_capture {
+                                    crop_h.filter(|&ch| ch > 0).map(|ch| readout_h as f64 / ch as f64)
+                                } else {
+                                    None
+                                };
                                 let tags = std::collections::HashMap::new();
-                                if let Some(rt) = db.process_readout("NIKON", model_name, readout_w, readout_h, fps, scale_35mm.unwrap_or(1.0), sensor_w, &tags, map, options) {
+                                if let Some(rt) = db.process_readout_subsampled("NIKON", model_name, readout_w, readout_h, fps, scale_35mm.unwrap_or(1.0), sensor_w, subsampled_ratio, &tags, map, options) {
                                     self.frame_readout_time = Some(rt);
                                 }
                             }
@@ -1118,5 +1152,100 @@ mod tests {
 
             assert!(detected.is_some(), "{ext} should use Nikon detection");
         }
+    }
+
+    fn short_array_tag(tag_id: u32, values: &[u16]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&tag_id.to_be_bytes());
+        data.extend_from_slice(&3u16.to_be_bytes()); // SHORT
+        data.extend_from_slice(&(values.len() as u16).to_be_bytes());
+        for v in values {
+            data.extend_from_slice(&v.to_be_bytes());
+        }
+        data
+    }
+
+    fn long_array_tag(tag_id: u32, values: &[u32]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&tag_id.to_be_bytes());
+        data.extend_from_slice(&4u16.to_be_bytes()); // LONG
+        data.extend_from_slice(&(values.len() as u16).to_be_bytes());
+        for v in values {
+            data.extend_from_slice(&v.to_be_bytes());
+        }
+        data
+    }
+
+    fn clip_md(map: &GroupedTagMap) -> serde_json::Map<String, serde_json::Value> {
+        map.get(&GroupId::Default)
+            .and_then(|m| m.get_t(TagId::Metadata) as Option<&serde_json::Value>)
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn nraw_recording_info_tag_full_parse() {
+        let mut nikon = Nikon::default();
+        let mut map = GroupedTagMap::new();
+        nikon
+            .parse_nev_clip_metadata(&short_array_tag(0x0000_1015, &[1, 49, 1, 12, 4128, 2322]), &mut map, &crate::InputOptions::default())
+            .unwrap();
+
+        let md = clip_md(&map);
+        assert!(nikon.is_proxy);
+        assert_eq!(nikon.nraw_width, Some(4128));
+        assert_eq!(nikon.nraw_height, Some(2322));
+        assert_eq!(md.get("proxy_output").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(md.get("nraw_width").and_then(|v| v.as_u64()), Some(4128));
+        assert_eq!(md.get("nraw_height").and_then(|v| v.as_u64()), Some(2322));
+        assert_eq!(md.get("nraw_bit_depth").and_then(|v| v.as_u64()), Some(12));
+    }
+
+    #[test]
+    fn nraw_recording_info_tag_short_form_keeps_legacy_behavior() {
+        let mut nikon = Nikon::default();
+        let mut map = GroupedTagMap::new();
+        nikon
+            .parse_nev_clip_metadata(&short_array_tag(0x0000_1015, &[1]), &mut map, &crate::InputOptions::default())
+            .unwrap();
+
+        let md = clip_md(&map);
+        assert!(nikon.is_proxy);
+        assert_eq!(nikon.nraw_width, None);
+        assert_eq!(nikon.nraw_height, None);
+        assert_eq!(md.get("proxy_output").and_then(|v| v.as_u64()), Some(1));
+        assert!(!md.contains_key("nraw_width"));
+        assert!(!md.contains_key("nraw_height"));
+        assert!(!md.contains_key("nraw_bit_depth"));
+    }
+
+    #[test]
+    fn nraw_recording_info_tag_rejects_implausible_dimensions() {
+        let mut nikon = Nikon::default();
+        let mut map = GroupedTagMap::new();
+        nikon
+            .parse_nev_clip_metadata(&short_array_tag(0x0000_1015, &[1, 49, 1, 12, 100, 200]), &mut map, &crate::InputOptions::default())
+            .unwrap();
+
+        let md = clip_md(&map);
+        assert!(nikon.is_proxy);
+        assert_eq!(nikon.nraw_width, None);
+        assert_eq!(nikon.nraw_height, None);
+        assert!(!md.contains_key("nraw_width"));
+        assert!(!md.contains_key("nraw_height"));
+        assert!(!md.contains_key("nraw_bit_depth"));
+    }
+
+    #[test]
+    fn nctg_tag_0x13_is_frame_count() {
+        let mut nikon = Nikon::default();
+        let mut map = GroupedTagMap::new();
+        nikon
+            .parse_nev_clip_metadata(&long_array_tag(0x0000_0013, &[411, 0]), &mut map, &crate::InputOptions::default())
+            .unwrap();
+
+        let md = clip_md(&map);
+        assert_eq!(md.get("frame_count").and_then(|v| v.as_u64()), Some(411));
+        assert!(!md.contains_key("record_mode"));
     }
 }

@@ -247,6 +247,11 @@ impl CameraDatabase {
     }
 
     /// Look up readout time for a model, applying brand-specific adjustments.
+    ///
+    /// `nraw_subsampled_ratio`: only for N-RAW captures — readout lines / crop-area lines.
+    /// Below `NRAW_SUBSAMPLED_RATIO_MAX` the capture is a binned/line-skipped scan, so the
+    /// standard columns (calibrated for full-area scans of the same output class) must not
+    /// be used. Pass `None` for ordinary recordings.
     pub fn lookup_readout(
         &self,
         brand: &str,
@@ -256,6 +261,7 @@ impl CameraDatabase {
         fps: f64,
         scale_35mm: f64,
         sensor_w: f32,
+        nraw_subsampled_ratio: Option<f64>,
         tags: &HashMap<String, serde_json::Value>,
     ) -> Option<ReadoutResult> {
         let brand_data = self.brands.get(&brand.to_uppercase())?;
@@ -295,16 +301,39 @@ impl CameraDatabase {
             }
         }
 
-        // Standard column lookup with fallback
-        let col_indices = resolve_columns(&readout.columns, res_w, fps);
         let mut value: Option<f64> = None;
         let mut is_estimated = false;
 
-        for col in col_indices {
-            if let Some(Some(v)) = row.get(col) {
-                is_estimated = *v < 0.0;
-                value = Some(v.abs());
-                break;
+        // N-RAW subsampled scan: the (resolution × fps) column grid conflates full-area
+        // scans with binned/line-skipped scans of the same output class. Prefer a dedicated
+        // N-RAW column ("4KN60"); fall back to a line-count scaling estimate of the
+        // same-fps full-scan value.
+        if let Some(ratio) = nraw_subsampled_ratio {
+            if ratio < NRAW_SUBSAMPLED_RATIO_MAX {
+                for col in resolve_columns_nraw(&readout.columns, res_w, fps) {
+                    if let Some(Some(v)) = row.get(col) {
+                        is_estimated = *v < 0.0;
+                        value = Some(v.abs());
+                        break;
+                    }
+                }
+                if value.is_none() {
+                    if let Some(t_full) = full_scan_reference(&readout.columns, row, fps) {
+                        value = Some(t_full * ratio);
+                        is_estimated = true;
+                    }
+                }
+            }
+        }
+
+        // Standard column lookup with fallback
+        if value.is_none() {
+            for col in resolve_columns(&readout.columns, res_w, fps) {
+                if let Some(Some(v)) = row.get(col) {
+                    is_estimated = *v < 0.0;
+                    value = Some(v.abs());
+                    break;
+                }
             }
         }
 
@@ -355,7 +384,13 @@ impl CameraDatabase {
 
     /// Process readout lookup and write FrameReadoutTime tag. Returns readout_time_ms if found.
     pub fn process_readout(&self, brand: &str, model: &str, res_w: u32, res_h: u32, fps: f64, scale_35mm: f64, sensor_w: f32, tags: &HashMap<String, serde_json::Value>, map: &mut crate::tags_impl::GroupedTagMap, options: &crate::InputOptions) -> Option<f64> {
-        let result = self.lookup_readout(brand, model, res_w, res_h, fps, scale_35mm, sensor_w, tags)?;
+        self.process_readout_subsampled(brand, model, res_w, res_h, fps, scale_35mm, sensor_w, None, tags, map, options)
+    }
+
+    /// `process_readout` variant for N-RAW captures carrying a subsampled-scan ratio
+    /// (readout lines / crop-area lines). See `lookup_readout` for the ratio semantics.
+    pub fn process_readout_subsampled(&self, brand: &str, model: &str, res_w: u32, res_h: u32, fps: f64, scale_35mm: f64, sensor_w: f32, nraw_subsampled_ratio: Option<f64>, tags: &HashMap<String, serde_json::Value>, map: &mut crate::tags_impl::GroupedTagMap, options: &crate::InputOptions) -> Option<f64> {
+        let result = self.lookup_readout(brand, model, res_w, res_h, fps, scale_35mm, sensor_w, nraw_subsampled_ratio, tags)?;
         util::insert_tag(map, crate::tag!(parsed crate::tags_impl::GroupId::Imager, crate::tags_impl::TagId::FrameReadoutTime, "Frame readout time", f64, |v| format!("{:.4} ms", v), result.readout_time_ms, Vec::new()), options);
         if result.is_estimated {
             util::insert_tag(map, crate::tag!(parsed crate::tags_impl::GroupId::Imager, crate::tags_impl::TagId::Custom("readout_estimated".into()), "Readout time estimated", bool, |v| v.to_string(), true, Vec::new()), options);
@@ -418,6 +453,52 @@ fn fps_fallback(suffix: &str) -> &'static [&'static str] {
         "24"  => &["24"],
         _ => &[],
     }
+}
+
+/// Below this readout-lines / crop-area-lines ratio a capture is considered a
+/// binned/line-skipped (subsampled) scan; at or above it, a full-area scan.
+/// 2x2-binned N-RAW ≈ 0.50, full-area N-RAW ≈ 1.0 — both far from the threshold.
+const NRAW_SUBSAMPLED_RATIO_MAX: f64 = 0.75;
+
+/// Resolve N-RAW-specific columns (key pattern "<res-class>N<fps-class>", e.g. "4KN60")
+/// for a subsampled capture. Same fps fallback chain as `resolve_columns`, but no
+/// resolution-class fallback: N-RAW values must not leak across resolution classes.
+fn resolve_columns_nraw(columns: &[String], res_w: u32, fps: f64) -> Vec<usize> {
+    let prefix = match resolution_prefix(res_w) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let suffix = match fps_suffix(fps) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    let mut result = Vec::new();
+    for &fps_sfx in fps_fallback(suffix) {
+        let key = format!("{}N{}", prefix, fps_sfx);
+        if let Some(idx) = columns.iter().position(|c| c == &key) {
+            result.push(idx);
+        }
+    }
+    result
+}
+
+/// Full-area scan reference for line-count scaling: highest resolution class first
+/// (the largest class approximates the full-sensor scan), standard fps fallback within
+/// each class. N-RAW columns ("4KN60") never match the "<res-class><fps>" keys built here.
+fn full_scan_reference(columns: &[String], row: &[Option<f64>], fps: f64) -> Option<f64> {
+    let suffix = fps_suffix(fps)?;
+    for res_pfx in ["8K", "4K", "1K"] {
+        for &fps_sfx in fps_fallback(suffix) {
+            let key = format!("{}{}", res_pfx, fps_sfx);
+            if let Some(idx) = columns.iter().position(|c| c == &key) {
+                if let Some(Some(v)) = row.get(idx) {
+                    return Some(v.abs());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Resolve (resolution_w, fps) to a list of column indices to try, with fallback.
@@ -768,6 +849,117 @@ mod tests {
         let result = resolve_columns(&columns, 1920, 100.0);
         assert!(!result.is_empty());
         assert_eq!(columns[result[0]], "1K120");
+    }
+
+    fn z8_columns(with_nraw_col: bool) -> Vec<String> {
+        let mut cols: Vec<String> = vec![
+            "8K60","8K30","8K24",
+            "4K240","4K120","4K60","4K30","4K24",
+            "1K240","1K120","1K60","1K30","1K24",
+        ].into_iter().map(String::from).collect();
+        if with_nraw_col {
+            cols.push("4KN60".to_string());
+        }
+        cols
+    }
+
+    fn z8_row(nraw_col_value: Option<f64>, with_nraw_col: bool) -> Vec<Option<f64>> {
+        let mut row = vec![
+            Some(14.4), Some(14.4), Some(14.4),
+            None, Some(4.86), Some(14.5), Some(14.5), Some(14.5),
+            Some(3.1), Some(4.8), Some(4.8), Some(4.8), Some(4.8),
+        ];
+        if with_nraw_col {
+            row.push(nraw_col_value);
+        }
+        row
+    }
+
+    fn z8_test_db(nraw_col_value: Option<f64>, with_nraw_col: bool) -> CameraDatabase {
+        let mut data = HashMap::new();
+        data.insert("Z 8".to_string(), z8_row(nraw_col_value, with_nraw_col));
+        let brand = BrandData {
+            aliases: Vec::new(),
+            crop_type_map: HashMap::new(),
+            models: Vec::new(),
+            crop_rules: Vec::new(),
+            readout: ReadoutData {
+                columns: z8_columns(with_nraw_col),
+                data,
+                additional: HashMap::new(),
+            },
+            readout_adjust: Vec::new(),
+        };
+        let mut brands = HashMap::new();
+        brands.insert("NIKON".to_string(), brand);
+        CameraDatabase { brands }
+    }
+
+    #[test]
+    fn test_resolve_columns_nraw() {
+        let columns = z8_columns(true);
+
+        // 4.1K N-RAW 60p hits the dedicated column
+        let result = resolve_columns_nraw(&columns, 4128, 59.94);
+        assert_eq!(result.len(), 1);
+        assert_eq!(columns[result[0]], "4KN60");
+
+        // No resolution-class fallback: 1080p never borrows 4KN60
+        assert!(resolve_columns_nraw(&columns, 1920, 59.94).is_empty());
+
+        // No N-RAW columns at all -> empty
+        assert!(resolve_columns_nraw(&z8_columns(false), 4128, 59.94).is_empty());
+    }
+
+    #[test]
+    fn test_full_scan_reference() {
+        let columns = z8_columns(true);
+        // Value present in the N-RAW column must never be picked as full-scan reference
+        let row = z8_row(Some(4.9), true);
+
+        // 60 fps -> highest class full-scan column is 8K60 = 14.4
+        assert_eq!(full_scan_reference(&columns, &row, 59.94), Some(14.4));
+    }
+
+    #[test]
+    fn test_lookup_readout_nraw_scaling_estimate() {
+        // No calibrated 4KN60 value -> line-count scaling of 8K60 full scan
+        let db = z8_test_db(None, true);
+        let tags = HashMap::new();
+        let ratio = 2322.0 / 4656.0;
+        let r = db.lookup_readout("NIKON", "Z 8", 4128, 2322, 59.94, 1.0, 35.9, Some(ratio), &tags).unwrap();
+        assert!((r.readout_time_ms - 14.4 * ratio).abs() < 1e-9, "got {}", r.readout_time_ms);
+        assert!((r.readout_time_ms - 7.1814).abs() < 0.01);
+        assert!(r.is_estimated);
+    }
+
+    #[test]
+    fn test_lookup_readout_nraw_calibrated_column_wins() {
+        let db = z8_test_db(Some(4.9), true);
+        let tags = HashMap::new();
+        let r = db.lookup_readout("NIKON", "Z 8", 4128, 2322, 59.94, 1.0, 35.9, Some(2322.0 / 4656.0), &tags).unwrap();
+        assert_eq!(r.readout_time_ms, 4.9);
+        assert!(!r.is_estimated);
+    }
+
+    #[test]
+    fn test_lookup_readout_full_area_ratio_keeps_standard_path() {
+        // 8.3K N-RAW: ratio ~1.0 -> standard 8K60 column, byte-identical to before
+        let db = z8_test_db(Some(4.9), true);
+        let tags = HashMap::new();
+        let r = db.lookup_readout("NIKON", "Z 8", 8256, 4644, 59.94, 1.0, 35.9, Some(4644.0 / 4656.0), &tags).unwrap();
+        assert_eq!(r.readout_time_ms, 14.4);
+        assert!(!r.is_estimated);
+    }
+
+    #[test]
+    fn test_lookup_readout_no_ratio_unchanged() {
+        // Ordinary recordings (no ratio) keep the plain per-mode lookup
+        let db = z8_test_db(Some(4.9), true);
+        let tags = HashMap::new();
+        let r = db.lookup_readout("NIKON", "Z 8", 1920, 1080, 59.94, 1.0, 35.9, None, &tags).unwrap();
+        assert_eq!(r.readout_time_ms, 4.8);
+        assert!(!r.is_estimated);
     }
 
     #[test]
