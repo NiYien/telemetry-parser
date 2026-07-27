@@ -851,6 +851,71 @@ mod tests {
         assert_eq!(columns[result[0]], "1K120");
     }
 
+    fn canon_powershot_test_db(aliases: Vec<(&str, &str)>) -> CameraDatabase {
+        // Mirrors the PowerShot section of the niyien canon.json (models + sensor widths)
+        let model = |sw: f32| ModelData { sw, fixed_fl: None, clear_fl: false, extra: HashMap::new() };
+        let brand = BrandData {
+            aliases: aliases.into_iter().map(|(f, t)| (f.to_string(), t.to_string())).collect(),
+            crop_type_map: HashMap::new(),
+            models: vec![
+                ("V10".to_string(), model(12.47)),
+                ("V1".to_string(), model(17.6)),
+                ("G7X Mark III".to_string(), model(13.16)),
+                ("G7X Mark II".to_string(), model(13.16)),
+                ("G7X".to_string(), model(13.16)),
+            ],
+            crop_rules: Vec::new(),
+            readout: ReadoutData::default(),
+            readout_adjust: Vec::new(),
+        };
+        let mut brands = HashMap::new();
+        brands.insert("CANON".to_string(), brand);
+        CameraDatabase { brands }
+    }
+
+    fn powershot_aliases_file_order() -> Vec<(&'static str, &'static str)> {
+        // Same order as the alias entries in the real canon.json (V10 before V1)
+        vec![
+            ("PowerShot V10", "V10"),
+            ("PowerShot V1", "V1"),
+            ("PowerShot G7 X Mark III", "G7X Mark III"),
+            ("PowerShot G7 X Mark II", "G7X Mark II"),
+            ("PowerShot G7 X", "G7X"),
+        ]
+    }
+
+    #[test]
+    fn test_find_model_powershot_v1() {
+        let db = canon_powershot_test_db(powershot_aliases_file_order());
+        let (name, data) = db.find_model("CANON", "PowerShot V1").unwrap();
+        assert_eq!(name, "V1");
+        assert!((data.sw - 17.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_find_model_powershot_v10_substring_overlap() {
+        // "PowerShot V10" contains "PowerShot V1" as a substring, so the aliases are
+        // substring replacements that could apply in either order. Both orders must
+        // resolve to V10, never V1.
+        let file_order = powershot_aliases_file_order();
+        let mut reversed = file_order.clone();
+        reversed.reverse();
+        for aliases in [file_order, reversed] {
+            let db = canon_powershot_test_db(aliases);
+            let (name, data) = db.find_model("CANON", "PowerShot V10").unwrap();
+            assert_eq!(name, "V10");
+            assert!((data.sw - 12.47).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_find_model_powershot_g7x_mark_iii() {
+        let db = canon_powershot_test_db(powershot_aliases_file_order());
+        let (name, data) = db.find_model("CANON", "PowerShot G7 X Mark III").unwrap();
+        assert_eq!(name, "G7X Mark III");
+        assert!((data.sw - 13.16).abs() < 1e-6);
+    }
+
     fn z8_columns(with_nraw_col: bool) -> Vec<String> {
         let mut cols: Vec<String> = vec![
             "8K60","8K30","8K24",

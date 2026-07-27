@@ -39,7 +39,9 @@ impl Canon {
     }
 
     pub fn detect<P: AsRef<std::path::Path>>(buffer: &[u8], _filepath: P, _options: &crate::InputOptions) -> Option<Self> {
-        if memmem::find(buffer, b"Canon EOS").is_some() {
+        // PowerShot bodies (V1/V10/G7X) write "Canon PowerShot xxx" instead of "Canon EOS"
+        // in the UUID atom EXIF Model, so match both naming families.
+        if memmem::find(buffer, b"Canon EOS").is_some() || memmem::find(buffer, b"Canon PowerShot").is_some() {
             return Some(Self {
                 model: None,
                 lens: None,
@@ -1400,4 +1402,32 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
     }
 
     Ok((samples, creation_time, creation_subsec, video_md))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_powershot() {
+        // PowerShot bodies never write "Canon EOS" anywhere in the file
+        let buffer = b"....ftypmp42....Canon PowerShot V1....";
+        let c = Canon::detect(&buffer[..], "MVI_0449.MP4", &crate::InputOptions::default()).unwrap();
+        assert!(!c.is_crm);
+    }
+
+    #[test]
+    fn test_detect_eos_unchanged() {
+        let buffer = b"....ftypmp42....Canon EOS R5m2....";
+        assert!(Canon::detect(&buffer[..], "test.mp4", &crate::InputOptions::default()).is_some());
+        let crm = b"....ftypcrx....Canon EOS R5 C....";
+        let c = Canon::detect(&crm[..], "test.crm", &crate::InputOptions::default()).unwrap();
+        assert!(c.is_crm);
+    }
+
+    #[test]
+    fn test_detect_neither_returns_none() {
+        let buffer = b"....ftypmp42....NIKON Z 8....";
+        assert!(Canon::detect(&buffer[..], "test.mp4", &crate::InputOptions::default()).is_none());
+    }
 }
