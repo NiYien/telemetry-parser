@@ -324,9 +324,10 @@ impl Canon {
             util::get_video_metadata(stream, size).ok()
         };
 
-        // Parse Canon UUID EXIF for canon_fine, canon_crop, and fallback metadata (MP4 only)
+        // Parse Canon EXIF for canon_fine, canon_crop, and fallback metadata (MP4/MOV only).
+        // The wrapper box differs by container (MP4 -> uuid, MOV -> udta); see exif.rs.
         stream.seek(SeekFrom::Start(0))?;
-        let exif_data = if is_mxf { Err(Error::new(ErrorKind::NotFound, "MXF has no UUID EXIF")) } else { exif::parse_canon_uuid_exif(stream, size) };
+        let exif_data = if is_mxf { Err(Error::new(ErrorKind::NotFound, "MXF has no UUID EXIF")) } else { exif::parse_canon_exif(stream, size) };
 
         self.process_map(&mut samples, &options, exif_data.ok(), video_md.as_ref(), mxf_creation_time.as_deref(), mxf_creation_subsec.as_deref());
 

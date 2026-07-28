@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright © 2025 Adrian <adrian.eddy at gmail>
 
-//! Minimal TIFF/EXIF parser for Canon MP4 UUID atom.
+//! Minimal TIFF/EXIF parser for the Canon metadata atom.
 //! Extracts Model, FocalLength, LensModel, and Canon MakerNotes (canon_fine, canon_crop).
+//!
+//! Canon stores the same child layout (CNCV / CNDM / CNTH, optionally CNOP) under two
+//! different wrapper boxes depending on the container format: MP4 uses a private `uuid`
+//! box, MOV uses QuickTime's native `udta` box. Both wrappers feed the identical
+//! `CNTH -> CNDA -> JPEG APP1 -> TIFF IFD0` chain below.
 
 use std::io::*;
 // byteorder not needed here - using manual byte parsing for TIFF IFD
@@ -27,8 +32,17 @@ pub struct CanonExifData {
     pub subsec_time_original: Option<String>,
 }
 
-/// Find the Canon UUID atom inside an MP4 file and extract EXIF data from CNTH/CNDA.
-pub fn parse_canon_uuid_exif<T: Read + Seek>(stream: &mut T, file_size: usize) -> Result<CanonExifData> {
+/// Find the Canon metadata wrapper inside an MP4/MOV file and extract EXIF data from CNTH/CNDA.
+///
+/// Two wrapper forms are accepted among the direct children of `moov`:
+///   - `uuid` box whose UUID equals `CANON_UUID` — used by MP4 containers
+///   - `udta` box — used by MOV containers (e.g. EOS 5D Mark IV DCI 4K)
+///
+/// The `uuid` form is searched first across all direct children; `udta` is only consulted
+/// when no matching `uuid` box exists anywhere in `moov`. A `uuid` box that is found but
+/// yields no CNTH chain short-circuits to an error without falling through to `udta`, so
+/// MP4 behaviour is unchanged by the `udta` addition.
+pub fn parse_canon_exif<T: Read + Seek>(stream: &mut T, file_size: usize) -> Result<CanonExifData> {
     stream.seek(SeekFrom::Start(0))?;
 
     // Find moov atom
@@ -36,7 +50,7 @@ pub fn parse_canon_uuid_exif<T: Read + Seek>(stream: &mut T, file_size: usize) -
     let mut cursor = Cursor::new(moov_data.as_slice());
     let moov_len = moov_data.len() as u64;
 
-    // Find uuid atom with Canon UUID inside moov
+    // Pass 1: uuid atom with Canon UUID inside moov (MP4 containers)
     while cursor.position() < moov_len {
         let (typ, _pos, size, header_size) = util::read_box(&mut cursor)?;
         let content_size = size as i64 - header_size;
@@ -53,7 +67,7 @@ pub fn parse_canon_uuid_exif<T: Read + Seek>(stream: &mut T, file_size: usize) -
                 let end = start + uuid_content_size;
                 if end <= moov_data.len() {
                     let uuid_data = &moov_data[start..end];
-                    return parse_canon_uuid_content(uuid_data);
+                    return parse_canon_wrapper_content(uuid_data);
                 }
             }
             cursor.seek(SeekFrom::Current(content_size - 16))?;
@@ -62,7 +76,28 @@ pub fn parse_canon_uuid_exif<T: Read + Seek>(stream: &mut T, file_size: usize) -
         }
     }
 
-    Err(Error::new(ErrorKind::NotFound, "Canon UUID atom not found"))
+    // Pass 2: udta box inside moov (MOV containers). Identical child layout, same parser.
+    cursor.set_position(0);
+    while cursor.position() < moov_len {
+        let (typ, _pos, size, header_size) = util::read_box(&mut cursor)?;
+        let content_size = size as i64 - header_size;
+        if content_size <= 0 {
+            break;
+        }
+
+        if typ == util::fourcc("udta") {
+            let start = cursor.position() as usize;
+            let end = start + content_size as usize;
+            if end <= moov_data.len() {
+                if let Ok(data) = parse_canon_wrapper_content(&moov_data[start..end]) {
+                    return Ok(data);
+                }
+            }
+        }
+        cursor.seek(SeekFrom::Current(content_size))?;
+    }
+
+    Err(Error::new(ErrorKind::NotFound, "Canon EXIF atom not found"))
 }
 
 /// Read the moov atom data from the MP4 stream.
@@ -89,8 +124,9 @@ fn find_moov_atom<T: Read + Seek>(stream: &mut T, file_size: usize) -> Result<Ve
     Err(Error::new(ErrorKind::NotFound, "moov atom not found"))
 }
 
-/// Parse the content of the Canon UUID atom to find CNTH → CNDA → EXIF.
-fn parse_canon_uuid_content(data: &[u8]) -> Result<CanonExifData> {
+/// Parse the content of a Canon metadata wrapper (`uuid` or `udta`) to find CNTH → CNDA → EXIF.
+/// Sibling boxes (CNCV, CNDM, CNOP) are skipped by box-size traversal.
+fn parse_canon_wrapper_content(data: &[u8]) -> Result<CanonExifData> {
     let mut cursor = Cursor::new(data);
     let len = data.len() as u64;
 
@@ -333,6 +369,139 @@ fn read_u32(data: &[u8], offset: usize, is_le: bool) -> u32 {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ISOBMFF box: BE u32 size (incl. header) + 4CC type + content.
+    fn mp4_box(typ: &[u8; 4], content: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(content.len() + 8);
+        v.extend_from_slice(&((content.len() + 8) as u32).to_be_bytes());
+        v.extend_from_slice(typ);
+        v.extend_from_slice(content);
+        v
+    }
+
+    /// Minimal little-endian TIFF carrying only IFD0 tag 0x0110 (Model) as ASCII.
+    fn tiff_with_model(model: &str) -> Vec<u8> {
+        let mut value = model.as_bytes().to_vec();
+        value.push(0); // NUL terminator, counted by the ASCII count field
+        let mut t = Vec::new();
+        t.extend_from_slice(b"II");
+        t.extend_from_slice(&42u16.to_le_bytes());
+        t.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset
+        t.extend_from_slice(&1u16.to_le_bytes()); // entry count
+        t.extend_from_slice(&0x0110u16.to_le_bytes()); // Model
+        t.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+        t.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        t.extend_from_slice(&26u32.to_le_bytes()); // value offset (past next-IFD field)
+        t.extend_from_slice(&0u32.to_le_bytes()); // next IFD = none
+        assert_eq!(t.len(), 26, "value offset must match the end of IFD0");
+        t.extend_from_slice(&value);
+        t
+    }
+
+    /// CNDA payload: JPEG SOI + APP1 whose length field covers "Exif\0\0" plus the TIFF block.
+    fn cnda_payload(model: &str) -> Vec<u8> {
+        let tiff = tiff_with_model(model);
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        v.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        v.extend_from_slice(&((tiff.len() + 8) as u16).to_be_bytes());
+        v.extend_from_slice(b"Exif\x00\x00");
+        v.extend_from_slice(&tiff);
+        v
+    }
+
+    /// Children shared by both wrapper forms. `siblings` adds the CNCV/CNDM/CNOP boxes that
+    /// real files carry around CNTH, to prove box-size traversal skips them.
+    fn wrapper_children(model: &str, siblings: bool) -> Vec<u8> {
+        let mut v = Vec::new();
+        if siblings {
+            v.extend_from_slice(&mp4_box(b"CNCV", b"CanonEOS0501"));
+            v.extend_from_slice(&mp4_box(b"CNDM", &[0, 0, 0, 0]));
+        }
+        v.extend_from_slice(&mp4_box(b"CNTH", &mp4_box(b"CNDA", &cnda_payload(model))));
+        if siblings {
+            v.extend_from_slice(&mp4_box(b"CNOP", &[0u8; 8]));
+        }
+        v
+    }
+
+    fn canon_uuid_wrapper(model: &str, siblings: bool) -> Vec<u8> {
+        let mut c = CANON_UUID.to_vec();
+        c.extend_from_slice(&wrapper_children(model, siblings));
+        mp4_box(b"uuid", &c)
+    }
+
+    fn udta_wrapper(model: &str, siblings: bool) -> Vec<u8> {
+        mp4_box(b"udta", &wrapper_children(model, siblings))
+    }
+
+    /// Wrap pre-built moov children into a full file (ftyp + moov).
+    fn file_with_moov_children(children: &[u8]) -> Vec<u8> {
+        let mut moov = children.to_vec();
+        moov.extend_from_slice(&mp4_box(b"mvhd", &[0u8; 100]));
+        let mut file = mp4_box(b"ftyp", b"qt  \x00\x00\x02\x00");
+        file.extend_from_slice(&mp4_box(b"moov", &moov));
+        file
+    }
+
+    fn run(file: &[u8]) -> Result<CanonExifData> {
+        let len = file.len();
+        parse_canon_exif(&mut Cursor::new(file.to_vec()), len)
+    }
+
+    #[test]
+    fn udta_wrapper_is_parsed() {
+        // MOV containers (e.g. EOS 5D Mark IV DCI 4K) hang CNTH under moov/udta.
+        let file = file_with_moov_children(&udta_wrapper("Canon EOS 5D Mark IV", true));
+        let data = run(&file).expect("udta wrapper must resolve");
+        assert_eq!(data.model.as_deref(), Some("Canon EOS 5D Mark IV"));
+    }
+
+    #[test]
+    fn uuid_wrapper_is_parsed() {
+        // MP4 containers keep the pre-existing behaviour.
+        let file = file_with_moov_children(&canon_uuid_wrapper("Canon EOS R6m2", true));
+        let data = run(&file).expect("uuid wrapper must resolve");
+        assert_eq!(data.model.as_deref(), Some("Canon EOS R6m2"));
+    }
+
+    #[test]
+    fn uuid_wins_when_both_wrappers_present() {
+        let mut children = canon_uuid_wrapper("Canon EOS R6m2", false);
+        children.extend_from_slice(&udta_wrapper("Canon EOS 5D Mark IV", false));
+        let data = run(&file_with_moov_children(&children)).expect("must resolve");
+        assert_eq!(data.model.as_deref(), Some("Canon EOS R6m2"), "uuid must take priority");
+    }
+
+    #[test]
+    fn uuid_failure_does_not_fall_through_to_udta() {
+        // A Canon uuid box carrying no CNTH short-circuits; udta must not be consulted.
+        let mut uuid_content = CANON_UUID.to_vec();
+        uuid_content.extend_from_slice(&mp4_box(b"CNCV", b"CanonEOS0501"));
+        let mut children = mp4_box(b"uuid", &uuid_content);
+        children.extend_from_slice(&udta_wrapper("Canon EOS 5D Mark IV", false));
+        assert!(run(&file_with_moov_children(&children)).is_err(), "must not fall through to udta");
+    }
+
+    #[test]
+    fn no_wrapper_returns_not_found() {
+        let file = file_with_moov_children(&mp4_box(b"trak", &[0u8; 32]));
+        let err = run(&file).expect_err("no wrapper must be an error");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn non_canon_udta_returns_not_found() {
+        // A generic QuickTime udta without CNTH must not be mistaken for Canon metadata.
+        let udta = mp4_box(b"udta", &mp4_box(b"\xa9nam", b"some title"));
+        let err = run(&file_with_moov_children(&udta)).expect_err("plain udta must be an error");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+}
 
 fn read_string(tiff_data: &[u8], value_data: &[u8], value_offset: usize, count: usize) -> String {
     let _ = (tiff_data, value_offset); // Might be used for large strings
