@@ -13,6 +13,34 @@ use cndm_tags::get_tag;
 pub mod exif;
 
 
+/// Whether an APS-C-only lens (EF-S / RF-S) on this body implies a forced sensor crop.
+///
+/// Canon full-frame bodies switch to a 1.6x crop automatically when an APS-C-only lens
+/// is mounted, but first-generation RF bodies (EOS R, RP) and older DSLRs never write
+/// MakerNote 0x4049 — the only signal `camera_db`'s crop rule keys on. Lens identity
+/// covers those bodies.
+///
+/// The `sensor_w` guard is mandatory rather than defensive: `canon.json` also defines a
+/// `canon_crop` rule for APS-C bodies (`{"m":["R10","R7"],"tag":{"canon_crop":true},"c":1.8}`),
+/// where an RF-S lens is the native configuration and not a crop mode — without the guard
+/// those bodies would be handed an extra 1.8x factor. The 35.0 threshold separates APS-C
+/// (22.3) and Super35 (24.6) sensor widths from full-frame (35.9).
+pub(crate) fn aps_c_lens_implies_crop(lens_model: &str, sensor_w: f32) -> bool {
+    (lens_model.starts_with("EF-S") || lens_model.starts_with("RF-S")) && sensor_w >= 35.0
+}
+
+/// Which signal decided crop mode, for the diagnostic log. When both fire the
+/// MakerNote flag is reported, being the in-camera signal rather than an inference.
+pub(crate) fn crop_source_label(maker_note_crop: bool, lens_implies_crop: bool) -> &'static str {
+    if maker_note_crop {
+        "tag_0x4049"
+    } else if lens_implies_crop {
+        "aps_c_lens"
+    } else {
+        "none"
+    }
+}
+
 #[derive(Default)]
 pub struct Canon {
     pub model: Option<String>,
@@ -476,6 +504,11 @@ impl Canon {
         let fps = video_md.map(|v| v.fps).unwrap_or(0.0);
         let canon_fine = exif_data.as_ref().map_or(false, |e| e.canon_fine);
         let canon_crop_flag = exif_data.as_ref().map_or(false, |e| e.canon_crop);
+        // EXIF LensModel (ExifIFD tag 0xA434). Taken from CanonExifData rather than the
+        // sample tag_map: the tag_map's Lens/DisplayName entry is only written on the
+        // no-CNDM-samples path, so bodies that do emit CNDM samples may leave it empty
+        // or carry an unrelated CNDM value there.
+        let exif_lens_model = exif_data.as_ref().and_then(|e| e.lens_model.as_deref()).unwrap_or("");
 
         // Try JSON database first
         if let Some(db_path) = &options.camera_db_path {
@@ -501,7 +534,13 @@ impl Canon {
                                 if canon_fine {
                                     tags.insert("canon_fine".to_string(), serde_json::Value::Bool(true));
                                 }
-                                if canon_crop_flag {
+                                // Bodies that never write MakerNote 0x4049 (EOS R / RP and older)
+                                // still crop when an APS-C-only lens is mounted; see
+                                // `aps_c_lens_implies_crop` for the guard rationale.
+                                let lens_implies_crop =
+                                    aps_c_lens_implies_crop(exif_lens_model, sensor_w);
+                                let crop_source = crop_source_label(canon_crop_flag, lens_implies_crop);
+                                if canon_crop_flag || lens_implies_crop {
                                     tags.insert("canon_crop".to_string(), serde_json::Value::Bool(true));
                                 }
 
@@ -544,6 +583,21 @@ impl Canon {
                                 } else {
                                     None
                                 };
+
+                                // A wrong crop factor is invisible in the parsed output — it just
+                                // yields a plausible but wrong focal length. Record how the crop
+                                // was decided so focal-length regressions are diagnosable from a
+                                // log alone.
+                                log::info!(
+                                    "Canon: crop mode: source={} lens={:?} sensor_w={:.1} res={}x{} crop={:.4} upfl={}",
+                                    crop_source,
+                                    exif_lens_model,
+                                    sensor_w,
+                                    resolution_w_video,
+                                    resolution_h_video,
+                                    effective_crop,
+                                    unit_px_fl.map_or("none".to_string(), |v| format!("{v:.4}"))
+                                );
 
                                 // Write unit_pixel_focal_length to first sample (process_crop already wrote crop_factor)
                                 if let Some(upfl) = unit_px_fl {
@@ -1430,5 +1484,52 @@ mod tests {
     fn test_detect_neither_returns_none() {
         let buffer = b"....ftypmp42....NIKON Z 8....";
         assert!(Canon::detect(&buffer[..], "test.mp4", &crate::InputOptions::default()).is_none());
+    }
+
+    // ── APS-C-only lens implies crop on a full-frame body ──
+
+    #[test]
+    fn ef_s_lens_on_full_frame_implies_crop() {
+        // EOS R (sw 35.9) + EF-S18-135mm: the body force-crops, but writes no 0x4049.
+        assert!(aps_c_lens_implies_crop("EF-S18-135mm f/3.5-5.6 IS", 35.9));
+    }
+
+    #[test]
+    fn rf_s_lens_on_full_frame_implies_crop() {
+        assert!(aps_c_lens_implies_crop("RF-S18-45mm F4.5-6.3 IS STM", 35.9));
+    }
+
+    #[test]
+    fn aps_c_lens_on_aps_c_body_does_not_imply_crop() {
+        // RF-S on an R7/R10 is the native configuration. canon.json defines a separate
+        // 1.8x canon_crop rule for those bodies, so letting lens identity fire it here
+        // would push the focal length further from truth, not closer.
+        assert!(!aps_c_lens_implies_crop("RF-S18-150mm F3.5-6.3 IS STM", 22.3));
+    }
+
+    #[test]
+    fn super35_body_stays_below_the_full_frame_threshold() {
+        assert!(!aps_c_lens_implies_crop("EF-S18-135mm f/3.5-5.6 IS", 24.6));
+    }
+
+    #[test]
+    fn full_frame_lens_does_not_imply_crop() {
+        // "RF"/"EF" prefixes must not be confused with "RF-S"/"EF-S".
+        assert!(!aps_c_lens_implies_crop("RF24-105mm F4 L IS USM", 35.9));
+        assert!(!aps_c_lens_implies_crop("EF70-200mm f/2.8L IS III USM", 35.9));
+    }
+
+    #[test]
+    fn missing_lens_model_is_not_a_crop_signal() {
+        assert!(!aps_c_lens_implies_crop("", 35.9));
+    }
+
+    #[test]
+    fn crop_source_label_reports_the_deciding_signal() {
+        // MakerNote wins the label when both fire — it is the in-camera signal.
+        assert_eq!(crop_source_label(true, true), "tag_0x4049");
+        assert_eq!(crop_source_label(true, false), "tag_0x4049");
+        assert_eq!(crop_source_label(false, true), "aps_c_lens");
+        assert_eq!(crop_source_label(false, false), "none");
     }
 }
