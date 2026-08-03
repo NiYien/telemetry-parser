@@ -337,12 +337,26 @@ impl Sony {
                     self.model = Some(matched_name.to_string());
                     let sensor_w = model_data.sw;
 
-                    // Infer view_angle for crop rules
-                    let is_apsc_body = sensor_w < 30.0; // APS-C sensor
-                    let view_angle: Option<&str> = if is_apsc_body {
-                        Some("APSC")
-                    } else if sony_crop > 1.4 && sony_crop < 1.65 {
-                        Some("APSC") // Full-frame in APS-C crop mode
+                    // Infer view_angle for crop rules: the body's sensor size is the
+                    // only input.
+                    //
+                    // Do NOT reintroduce the `sony_crop in (1.4, 1.65) => APSC`
+                    // heuristic that used to sit here. `sony_crop` comes from RTMD tag
+                    // 0x810C (ElectricalExtenderMagnification), which carries Clear
+                    // Image Zoom / digital zoom - not the APS-C/Super35 shooting mode.
+                    // Measured on an A7R3 pair (one full-frame clip, one APS-C clip)
+                    // 0x810C reads 100 in both, so the heuristic never fired for a real
+                    // APS-C capture; it only misfired when the user enabled 1.4-1.65x
+                    // Clear Image Zoom, and then `db_crop * sony_crop` double-counted
+                    // the crop (1.523 * 1.5 = 2.2845). The original NiYien_Tool keeps
+                    // the equivalent branch commented out and keys it on the
+                    // 35mm-equivalent factor rather than a zoom ratio.
+                    //
+                    // Consequence: full-frame bodies in APS-C mode are currently not
+                    // detected at all, so the `va=APSC` crop rules stay unreachable for
+                    // them. That gap predates this code and is tracked separately.
+                    let view_angle: Option<&str> = if sensor_w < 30.0 {
+                        Some("APSC") // APS-C body
                     } else {
                         Some("FULL")
                     };
@@ -373,6 +387,20 @@ impl Sony {
                     if let Some(upfl) = unit_px_fl {
                         util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), upfl, Vec::new()), options);
                     }
+
+                    // Break the crop chain out into its components. Consumers only ever
+                    // see the fused `unit_pixel_focal_length`, which makes "did Clear
+                    // Image Zoom get picked up?" impossible to answer from a log alone -
+                    // a missing tag, a tag reading 100, and a tag that was read but not
+                    // applied all collapse to the same number. Only emitted when the
+                    // model matched, since there are no crop components otherwise.
+                    log::info!(target: "lens",
+                        "Sony crop: model={} sw={:.1} view_angle={} res={}x{} fps={:.3} db_crop={:.4} sony_crop={:.4} effective_crop={:.4} upfl={}",
+                        matched_name, sensor_w, view_angle.unwrap_or("-"),
+                        resolution_w, resolution_h, fps,
+                        db_crop, sony_crop, effective_crop,
+                        unit_px_fl.map(|v| format!("{v:.4}")).unwrap_or_else(|| "None".into())
+                    );
 
                     Some((sensor_w, effective_crop, unit_px_fl))
                 } else {
