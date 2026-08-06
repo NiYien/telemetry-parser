@@ -98,19 +98,76 @@ impl BlackmagicBraw {
         n
     }
 
-    /// Max native sensor resolution width in pixels per model (ref NiYien Tool bmd.cpp)
+    /// Max native sensor resolution width in pixels per model.
+    ///
+    /// Correctness criterion: with square photosites, the sensor's physical
+    /// aspect ratio must equal the aspect ratio of the resolution listed here.
+    /// Where a model also has a hardcoded PixelPitch below, `sensor_width /
+    /// PixelPitch` must agree with this value (within one pixel); the two are
+    /// cross-checks of each other.
+    ///
+    /// Do NOT take `NiYien_Tool/camera/bmd.cpp` at face value: its
+    /// `BMD_MODEL_LIST` resolution lists and its `bmd_calc_profile` `max_frame`
+    /// constants contradict each other. In particular that file lumps BMCC 4K
+    /// together with BMPCC 4K under `max_frame = 4096`, which is wrong for
+    /// BMCC 4K: 21.12 x 11.88 mm is 1.778, i.e. 3840x2160, and the same file's
+    /// model list says "3840x2160". BMCC 4K stays 3840 -- do not "fix" it.
+    ///
+    /// Every model present in camera_db/blackmagic.json must appear here, keyed
+    /// by its canonical (post-alias) name. A miss returns 0 and the `.max(1)`
+    /// guard at the call site collapses `unit_pixel_focal_length` to
+    /// `1 / sensor_width`, which is how "BMSC 4K G2" used to yield 0.0527.
     fn max_resolution_w(model: &str) -> u32 {
         match model {
-            "BMPCC"                  => 1920,
-            "BMCC 4K"               => 3840,
-            "BMCC 6K"               => 6048,
-            "BMPCC 4K"              => 3840,
-            "BMPCC 6K"              => 6144,
+            "BMPCC"                  => 1920,  // 12.48 x 7.02  -> 1.778
+            "BMCC 4K"               => 3840,  // 21.12 x 11.88 -> 1.778
+            "BMCC 6K"               => 6048,  // 36.00 x 24.00 -> 1.500
+            "BMPCC 4K"              => 4096,  // 18.96 x 10.00 -> 1.896; 18.96mm / 4628nm = 4096.8 px
+            "BMSC 4K G2"            => 4096,  // same sensor as BMPCC 4K (Micro Studio Camera 4K G2)
+            "BMPCC 6K"              => 6144,  // 23.10 x 12.99 -> 1.778
             "URSA Mini 4K"          => 3840,
-            "URSA Mini 4.6K"        => 4608,
+            "URSA Mini 4.6K"        => 4608,  // 25.34 x 14.25 -> 1.778
             "URSA Mini Pro 4.6K G2" => 4608,
-            "URSA Mini Pro 12K"     => 12288,
+            "URSA Mini Pro 12K"     => 12288, // 27.03 x 14.25 -> 1.897
             _ => 0
+        }
+    }
+
+    /// Convert `unit_pixel_focal_length` (pixels per mm) into a square pixel
+    /// pitch in nanometres, refusing values that cannot be a real sensor.
+    ///
+    /// The plausibility window exists because `max_resolution_w` returning 0 for
+    /// an unlisted model makes the caller's `.max(1)` collapse the pitch by
+    /// roughly `sensor_width` orders of magnitude. Refusing to emit leaves the
+    /// consumer on its previous fallback, which is wrong but bounded; emitting
+    /// the collapsed value would skew every rendered frame instead. Digital
+    /// cinema and photo sensors sit between 0.5 um and 20 um per photosite,
+    /// i.e. 50..2000 pixels per mm; every Blackmagic model currently in
+    /// camera_db lands between 153.85 and 454.6.
+    fn pixel_pitch_nm_from_upfl(upfl: f64) -> Option<u32> {
+        const UPFL_MIN_PX_PER_MM: f64 = 50.0;
+        const UPFL_MAX_PX_PER_MM: f64 = 2000.0;
+        if !upfl.is_finite() || !(UPFL_MIN_PX_PER_MM..=UPFL_MAX_PX_PER_MM).contains(&upfl) {
+            return None;
+        }
+        Some((1_000_000.0 / upfl).round() as u32)
+    }
+
+    /// Emit a PixelPitch derived from `upfl`, but never over an existing one.
+    ///
+    /// `util::insert_tag` is a plain map insert, so an unguarded write would
+    /// replace the hardcoded pitches of the Pocket Cinema / Micro Studio models
+    /// -- all of which do resolve through camera_db and therefore do reach this
+    /// code path. Those measured values stay authoritative.
+    fn emit_derived_pixel_pitch(map: &mut GroupedTagMap, upfl: f64, options: &crate::InputOptions) {
+        let already_present = map
+            .get(&GroupId::Imager)
+            .map_or(false, |m| m.contains_key(&TagId::PixelPitch));
+        if already_present {
+            return;
+        }
+        if let Some(pitch_nm) = Self::pixel_pitch_nm_from_upfl(upfl) {
+            util::insert_tag(map, tag!(parsed GroupId::Imager, TagId::PixelPitch, "Pixel pitch", u32x2, |v| format!("{v:?}"), (pitch_nm, pitch_nm), vec![]), options);
         }
     }
 
@@ -216,6 +273,20 @@ impl BlackmagicBraw {
                                 if effective_sensor_w > 0.0 {
                                     let unit_px_fl = captured_w / effective_sensor_w;
                                     util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit_px_fl, vec![]), &options);
+                                    // BRAW states how many pixels were read out, never how
+                                    // wide those pixels are, so the file carries no pitch and
+                                    // no millimetre quantity at all. Without PixelPitch the
+                                    // consumer's lens_params gate (pixel_pitch +
+                                    // capture_area_size + focal_length) cannot be satisfied
+                                    // and the per-frame camera matrix falls back to a default.
+                                    // The pitch is exactly the reciprocal of the pixels-per-mm
+                                    // we just derived, so emit it here and reuse the path RED
+                                    // and the Pocket Cinema models already take.
+                                    //
+                                    // This is the inverse of the `upfl = 1e6 / pitch` fallback
+                                    // further below; the two are mutually exclusive because
+                                    // each only fires when the other's output is absent.
+                                    Self::emit_derived_pixel_pitch(&mut map, unit_px_fl, &options);
                                 }
                             }
                         }
@@ -839,5 +910,103 @@ impl BlackmagicBraw {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pitch_of(map: &GroupedTagMap) -> Option<(u32, u32)> {
+        map.get(&GroupId::Imager)
+            .and_then(|m| m.get_t(TagId::PixelPitch) as Option<&(u32, u32)>)
+            .copied()
+    }
+
+    fn hardcoded_pitch_map(nm: u32) -> GroupedTagMap {
+        let mut map = GroupedTagMap::new();
+        let options = crate::InputOptions::default();
+        util::insert_tag(&mut map, tag!(parsed GroupId::Imager, TagId::PixelPitch, "Pixel pitch", u32x2, |v| format!("{v:?}"), (nm, nm), vec![]), &options);
+        map
+    }
+
+    // ---- max_resolution_w: sensor aspect ratio must match the listed resolution ----
+
+    #[test]
+    fn max_resolution_w_matches_sensor_aspect_ratio() {
+        // 18.96 x 10.00 -> 1.896, and 18.96mm / 4628nm = 4096.8 px
+        assert_eq!(BlackmagicBraw::max_resolution_w("BMPCC 4K"), 4096);
+        // Micro Studio Camera 4K G2 shares the BMPCC 4K sensor
+        assert_eq!(BlackmagicBraw::max_resolution_w("BMSC 4K G2"), 4096);
+        // 21.12 x 11.88 -> 1.778 = 3840/2160. bmd.cpp lumps this with BMPCC 4K
+        // under max_frame = 4096; that is the source file's own error.
+        assert_eq!(BlackmagicBraw::max_resolution_w("BMCC 4K"), 3840);
+        assert_eq!(BlackmagicBraw::max_resolution_w("BMCC 6K"), 6048);
+        assert_eq!(BlackmagicBraw::max_resolution_w("BMPCC 6K"), 6144);
+    }
+
+    #[test]
+    fn max_resolution_w_covers_every_camera_db_model() {
+        // A miss returns 0, and the caller's `.max(1)` then collapses
+        // unit_pixel_focal_length to 1/sensor_width. Keep this list in sync with
+        // camera_db/blackmagic.json `models`.
+        for model in [
+            "BMPCC", "BMCC 4K", "BMCC 6K", "BMPCC 4K", "BMSC 4K G2", "BMPCC 6K",
+            "URSA Mini 4K", "URSA Mini 4.6K", "URSA Mini Pro 4.6K G2", "URSA Mini Pro 12K",
+        ] {
+            assert!(BlackmagicBraw::max_resolution_w(model) > 0, "{model} missing from max_resolution_w");
+        }
+    }
+
+    // ---- pixel_pitch_nm_from_upfl ----
+
+    #[test]
+    fn pixel_pitch_from_upfl_inverts_the_scale() {
+        // BMCC 6K: 6048 px / 36.0 mm -> 5952.38 nm, i.e. 36mm/6048px
+        assert_eq!(BlackmagicBraw::pixel_pitch_nm_from_upfl(168.0), Some(5952));
+        // BMPCC 6K's measured 3759 nm and BMPCC 4K's 4628 nm round-trip to
+        // within a nanometre of the camera_db-derived scale.
+        assert_eq!(BlackmagicBraw::pixel_pitch_nm_from_upfl(6144.0 / 23.10), Some(3760));
+        assert_eq!(BlackmagicBraw::pixel_pitch_nm_from_upfl(4096.0 / 18.96), Some(4629));
+    }
+
+    #[test]
+    fn pixel_pitch_from_upfl_rejects_implausible_values() {
+        // The collapse that an unlisted max_resolution_w used to produce
+        // ("BMSC 4K G2": 1/18.96). Emitting 18.96 mm per pixel would skew
+        // every rendered frame.
+        assert_eq!(BlackmagicBraw::pixel_pitch_nm_from_upfl(1.0 / 18.96), None);
+        assert_eq!(BlackmagicBraw::pixel_pitch_nm_from_upfl(3000.0), None);
+        assert_eq!(BlackmagicBraw::pixel_pitch_nm_from_upfl(0.0), None);
+        assert_eq!(BlackmagicBraw::pixel_pitch_nm_from_upfl(f64::NAN), None);
+    }
+
+    // ---- emit_derived_pixel_pitch ----
+
+    #[test]
+    fn derived_pixel_pitch_is_written_when_absent() {
+        let mut map = GroupedTagMap::new();
+        BlackmagicBraw::emit_derived_pixel_pitch(&mut map, 168.0, &crate::InputOptions::default());
+        assert_eq!(pitch_of(&map), Some((5952, 5952)));
+    }
+
+    #[test]
+    fn derived_pixel_pitch_never_overwrites_a_hardcoded_one() {
+        // insert_tag is a plain map insert, and the Pocket Cinema models do
+        // resolve through camera_db, so they do reach this code path.
+        let mut map = hardcoded_pitch_map(3759);
+        BlackmagicBraw::emit_derived_pixel_pitch(&mut map, 6144.0 / 23.10, &crate::InputOptions::default());
+        assert_eq!(pitch_of(&map), Some((3759, 3759)));
+
+        let mut map = hardcoded_pitch_map(4628);
+        BlackmagicBraw::emit_derived_pixel_pitch(&mut map, 4096.0 / 18.96, &crate::InputOptions::default());
+        assert_eq!(pitch_of(&map), Some((4628, 4628)));
+    }
+
+    #[test]
+    fn derived_pixel_pitch_is_skipped_when_upfl_is_implausible() {
+        let mut map = GroupedTagMap::new();
+        BlackmagicBraw::emit_derived_pixel_pitch(&mut map, 1.0 / 18.96, &crate::InputOptions::default());
+        assert_eq!(pitch_of(&map), None, "an implausible scale must leave the consumer on its previous fallback");
     }
 }
