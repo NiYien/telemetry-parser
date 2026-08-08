@@ -120,6 +120,7 @@ impl BlackmagicBraw {
     fn max_resolution_w(model: &str) -> u32 {
         match model {
             "BMPCC"                  => 1920,  // 12.48 x 7.02  -> 1.778
+            "BMCC"                  => 2432,  // 15.81 x 8.88  -> 1.780; original Cinema Camera 2.5K (not in NiYien Tool, calibrated from official specs)
             "BMCC 4K"               => 3840,  // 21.12 x 11.88 -> 1.778
             "BMCC 6K"               => 6048,  // 36.00 x 24.00 -> 1.500
             "BMPCC 4K"              => 4096,  // 18.96 x 10.00 -> 1.896; 18.96mm / 4628nm = 4096.8 px
@@ -580,13 +581,28 @@ impl BlackmagicBraw {
             }
         }
         // Level 4: DNG TIFF IFD (only for DNG/TIFF files, not MOV/MP4)
-        if model_name.is_none() && tiff_ifd::is_tiff_header(&all) {
+        // Also picks up ImageWidth/ImageLength (0x0100/0x0101) as a resolution
+        // fallback: util::get_video_metadata below only understands MXF/BRAW/MP4
+        // containers and always fails on TIFF, which would leave resolution_w=0
+        // and skip the camera_db upfl derivation entirely for CinemaDNG.
+        let mut tiff_width = 0u32;
+        let mut tiff_height = 0u32;
+        let is_tiff = tiff_ifd::is_tiff_header(&all);
+        if model_name.is_none() && is_tiff {
+            // First scalar of a SHORT (3) or LONG (4) entry
+            fn tiff_uint(typ: u16, value_data: &[u8], is_le: bool) -> u32 {
+                match typ {
+                    3 => tiff_ifd::read_u16(value_data, 0, is_le).map(|v| v as u32).unwrap_or(0),
+                    4 => tiff_ifd::read_u32(value_data, 0, is_le).unwrap_or(0),
+                    _ => 0,
+                }
+            }
             let is_le = tiff_ifd::detect_byte_order(&all).unwrap_or(true);
             if let Some(ifd0_offset) = tiff_ifd::read_u32(&all, 4, is_le) {
                 let mut unique_model = None;
                 let mut model_tag = None;
                 tiff_ifd::parse_ifd_entries(&all, ifd0_offset as usize, is_le,
-                    &mut |tag, _typ, count, value_data, _value_offset| {
+                    &mut |tag, typ, count, value_data, _value_offset| {
                         match tag {
                             0xC614 => { // UniqueCameraModel (preferred)
                                 let s = tiff_ifd::read_string(value_data, count);
@@ -596,6 +612,8 @@ impl BlackmagicBraw {
                                 let s = tiff_ifd::read_string(value_data, count);
                                 if s.contains("Blackmagic") { model_tag = Some(s); }
                             }
+                            0x0100 => { tiff_width  = tiff_uint(typ, value_data, is_le); } // ImageWidth
+                            0x0101 => { tiff_height = tiff_uint(typ, value_data, is_le); } // ImageLength
                             _ => {}
                         }
                     });
@@ -649,8 +667,20 @@ impl BlackmagicBraw {
         // Get video metadata (resolution, fps) from QuickTime track
         stream.seek(SeekFrom::Start(0))?;
         let video_md = util::get_video_metadata(stream, size).ok();
-        let resolution_w = video_md.as_ref().map(|v| v.width as u32).unwrap_or(0);
-        let resolution_h = video_md.as_ref().map(|v| v.height as u32).unwrap_or(0);
+        let mut resolution_w = video_md.as_ref().map(|v| v.width as u32).unwrap_or(0);
+        let mut resolution_h = video_md.as_ref().map(|v| v.height as u32).unwrap_or(0);
+        // TIFF/DNG fallback: there is no QuickTime track to read the size from.
+        // Only takes over when the container gave nothing (resolution_w == 0),
+        // so MOV/MP4 output is unchanged by control flow, not by coincidence.
+        // upfl does not depend on which IFD this size came from (thumbnail or
+        // raw): resolution_w cancels out in upfl = w / (sw * w / max_res).
+        // The resolution-segmented crop/readout tables are NOT insensitive to
+        // it -- before adding any such rule for a CinemaDNG model, follow the
+        // SubIFD (NewSubfileType=0) to get the real raw dimensions first.
+        if resolution_w == 0 && tiff_width > 0 {
+            resolution_w = tiff_width;
+            resolution_h = tiff_height;
+        }
         let fps = video_md.as_ref().map(|v| v.fps).unwrap_or(0.0);
         if fps > 0.0 {
             util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:?}", v), fps, vec![]), &options);
@@ -734,30 +764,36 @@ impl BlackmagicBraw {
         let mut accl = Vec::new();
         let cancel_flag2 = cancel_flag.clone();
         let _ = progress_cb; // Progress is not easily tracked for metadata-only parse
-        util::get_metadata_track_samples(stream, size, false, |info: SampleInfo, data: &[u8], _file_position: u64, _video_md: Option<&VideoMetadata>| {
-            if data.len() >= 4+4+3*4 {
-                let mut d = Cursor::new(data);
-                crate::try_block!({
-                    d.seek(SeekFrom::Start(8)).ok()?;
-                    if &data[4..8] == b"mogy" {
-                        gyro.push(TimeVector3 { t: (info.timestamp_ms - self.frame_readout_time.unwrap_or(0.0) / 2.0) / 1000.0,
-                            x: d.read_f32::<LittleEndian>().ok()? as f64,
-                            y: d.read_f32::<LittleEndian>().ok()? as f64,
-                            z: d.read_f32::<LittleEndian>().ok()? as f64
-                        });
-                    } else if &data[4..8] == b"moac" {
-                        accl.push(TimeVector3 { t: (info.timestamp_ms - self.frame_readout_time.unwrap_or(0.0) / 2.0) / 1000.0,
-                            x: -d.read_f32::<LittleEndian>().ok()? as f64,
-                            y: -d.read_f32::<LittleEndian>().ok()? as f64,
-                            z: -d.read_f32::<LittleEndian>().ok()? as f64
-                        });
-                    }
-                });
-            }
-            if options.probe_only {
-                cancel_flag2.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        }, cancel_flag)?;
+        // TIFF/DNG has no QuickTime metadata track: get_metadata_track_samples
+        // fails at parse_mp4 and `?` would discard the whole tag map built above
+        // (the caller swallows the Err into samples=None). This, not the missing
+        // resolution alone, is why CinemaDNG used to come back with samples=0.
+        if !is_tiff {
+            util::get_metadata_track_samples(stream, size, false, |info: SampleInfo, data: &[u8], _file_position: u64, _video_md: Option<&VideoMetadata>| {
+                if data.len() >= 4+4+3*4 {
+                    let mut d = Cursor::new(data);
+                    crate::try_block!({
+                        d.seek(SeekFrom::Start(8)).ok()?;
+                        if &data[4..8] == b"mogy" {
+                            gyro.push(TimeVector3 { t: (info.timestamp_ms - self.frame_readout_time.unwrap_or(0.0) / 2.0) / 1000.0,
+                                x: d.read_f32::<LittleEndian>().ok()? as f64,
+                                y: d.read_f32::<LittleEndian>().ok()? as f64,
+                                z: d.read_f32::<LittleEndian>().ok()? as f64
+                            });
+                        } else if &data[4..8] == b"moac" {
+                            accl.push(TimeVector3 { t: (info.timestamp_ms - self.frame_readout_time.unwrap_or(0.0) / 2.0) / 1000.0,
+                                x: -d.read_f32::<LittleEndian>().ok()? as f64,
+                                y: -d.read_f32::<LittleEndian>().ok()? as f64,
+                                z: -d.read_f32::<LittleEndian>().ok()? as f64
+                            });
+                        }
+                    });
+                }
+                if options.probe_only {
+                    cancel_flag2.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }, cancel_flag)?;
+        }
 
         util::insert_tag(&mut map, tag!(parsed GroupId::Accelerometer, TagId::Data, "Accelerometer data", Vec_TimeVector3_f64, |v| format!("{:?}", v), accl, vec![]), &options);
         util::insert_tag(&mut map, tag!(parsed GroupId::Gyroscope,     TagId::Data, "Gyroscope data",     Vec_TimeVector3_f64, |v| format!("{:?}", v), gyro, vec![]), &options);
@@ -943,6 +979,8 @@ mod tests {
         assert_eq!(BlackmagicBraw::max_resolution_w("BMCC 4K"), 3840);
         assert_eq!(BlackmagicBraw::max_resolution_w("BMCC 6K"), 6048);
         assert_eq!(BlackmagicBraw::max_resolution_w("BMPCC 6K"), 6144);
+        // Original Cinema Camera 2.5K: 15.81 x 8.88 -> 1.780 = 2432/1366
+        assert_eq!(BlackmagicBraw::max_resolution_w("BMCC"), 2432);
     }
 
     #[test]
@@ -951,7 +989,7 @@ mod tests {
         // unit_pixel_focal_length to 1/sensor_width. Keep this list in sync with
         // camera_db/blackmagic.json `models`.
         for model in [
-            "BMPCC", "BMCC 4K", "BMCC 6K", "BMPCC 4K", "BMSC 4K G2", "BMPCC 6K",
+            "BMPCC", "BMCC", "BMCC 4K", "BMCC 6K", "BMPCC 4K", "BMSC 4K G2", "BMPCC 6K",
             "URSA Mini 4K", "URSA Mini 4.6K", "URSA Mini Pro 4.6K G2", "URSA Mini Pro 12K",
         ] {
             assert!(BlackmagicBraw::max_resolution_w(model) > 0, "{model} missing from max_resolution_w");
@@ -1008,5 +1046,66 @@ mod tests {
         let mut map = GroupedTagMap::new();
         BlackmagicBraw::emit_derived_pixel_pitch(&mut map, 1.0 / 18.96, &crate::InputOptions::default());
         assert_eq!(pitch_of(&map), None, "an implausible scale must leave the consumer on its previous fallback");
+    }
+
+    // ---- CinemaDNG: TIFF resolution fallback + camera_db upfl (feedback 20260807-441084d0) ----
+
+    fn push_ifd_entry(d: &mut Vec<u8>, tag: u16, typ: u16, cnt: u32, val: u32) {
+        d.extend_from_slice(&tag.to_le_bytes());
+        d.extend_from_slice(&typ.to_le_bytes());
+        d.extend_from_slice(&cnt.to_le_bytes());
+        d.extend_from_slice(&val.to_le_bytes());
+    }
+
+    fn synthetic_bmcc_dng() -> Vec<u8> {
+        // Minimal little-endian TIFF: IFD0 with ImageWidth (LONG), ImageLength
+        // (SHORT, to exercise both scalar types) and UniqueCameraModel (ASCII,
+        // indirect). header(8) + count(2) + 3*12 + next(4) = 50.
+        let model = b"Blackmagic Cinema Camera\0";
+        let str_offset = 50u32;
+        let mut d = Vec::new();
+        d.extend_from_slice(b"II");
+        d.extend_from_slice(&42u16.to_le_bytes());
+        d.extend_from_slice(&8u32.to_le_bytes());
+        d.extend_from_slice(&3u16.to_le_bytes());
+        push_ifd_entry(&mut d, 0x0100, 4, 1, 2432);                        // ImageWidth
+        push_ifd_entry(&mut d, 0x0101, 3, 1, 1366);                        // ImageLength
+        push_ifd_entry(&mut d, 0xC614, 2, model.len() as u32, str_offset); // UniqueCameraModel
+        d.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(d.len(), str_offset as usize);
+        d.extend_from_slice(model);
+        d
+    }
+
+    #[test]
+    fn cinemadng_parse_derives_upfl_from_tiff_fallback() {
+        // Without the TIFF fallback, util::get_video_metadata fails on TIFF and
+        // resolution_w stays 0, so the camera_db block never emits upfl; and
+        // without the is_tiff guard, get_metadata_track_samples errors out and
+        // the whole tag map is discarded (samples=None at the caller).
+        let db_dir = std::env::temp_dir().join("tp-test-camera-db-bmcc25k");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::write(db_dir.join("blackmagic.json"),
+            r#"{ "version": 1, "aliases": {}, "models": { "BMCC": { "sw": 15.81 } } }"#).unwrap();
+
+        let bytes = synthetic_bmcc_dng();
+        let options = crate::InputOptions {
+            camera_db_path: Some(db_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        assert!(BlackmagicBraw::detect(&bytes, "test.dng", &options).is_some(), "synthetic DNG must pass detect");
+
+        let mut bmd = BlackmagicBraw::default();
+        let mut stream = Cursor::new(&bytes);
+        let samples = bmd.parse(&mut stream, bytes.len(), |_| (), Arc::new(AtomicBool::new(false)), options)
+            .expect("TIFF input must not error out of parse_non_braw");
+
+        assert_eq!(bmd.model.as_deref(), Some("BMCC"));
+        let map = samples.first().and_then(|s| s.tag_map.as_ref()).expect("tag map must survive");
+        let upfl: f64 = *(map.get(&GroupId::Lens)
+            .and_then(|m| m.get_t(TagId::Custom("unit_pixel_focal_length".into())) as Option<&f64>)
+            .expect("upfl must be emitted"));
+        let expected = 2432.0 / 15.81f32 as f64;
+        assert!((upfl - expected).abs() < 1e-6, "upfl = {upfl}, expected ~{expected}");
     }
 }

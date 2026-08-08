@@ -916,6 +916,46 @@ mod tests {
         assert!((data.sw - 13.16).abs() < 1e-6);
     }
 
+    fn bmd_bmcc_test_db() -> CameraDatabase {
+        // Mirrors the BMCC family of the niyien blackmagic.json: the bare "BMCC"
+        // entry (original Cinema Camera 2.5K) coexists with the longer keys.
+        let model = |sw: f32| ModelData { sw, fixed_fl: None, clear_fl: false, extra: HashMap::new() };
+        let brand = BrandData {
+            aliases: Vec::new(),
+            crop_type_map: HashMap::new(),
+            models: vec![
+                ("BMCC".to_string(), model(15.81)),
+                ("BMCC 4K".to_string(), model(21.12)),
+                ("BMCC 6K".to_string(), model(36.0)),
+            ],
+            crop_rules: Vec::new(),
+            readout: ReadoutData::default(),
+            readout_adjust: Vec::new(),
+        };
+        let mut brands = HashMap::new();
+        brands.insert("BLACKMAGIC".to_string(), brand);
+        CameraDatabase { brands }
+    }
+
+    #[test]
+    fn test_find_model_bare_bmcc_no_substring_collision() {
+        // Bare "BMCC" (normalized "Blackmagic Cinema Camera" 2.5K) must hit its
+        // own entry, while "BMCC 4K"/"BMCC 6K" keep hitting the longer keys --
+        // longest-substring semantics, same shape as the bare "BMPCC" precedent.
+        let db = bmd_bmcc_test_db();
+        let (name, data) = db.find_model("BLACKMAGIC", "BMCC").unwrap();
+        assert_eq!(name, "BMCC");
+        assert!((data.sw - 15.81).abs() < 1e-6);
+
+        let (name, data) = db.find_model("BLACKMAGIC", "BMCC 4K").unwrap();
+        assert_eq!(name, "BMCC 4K");
+        assert!((data.sw - 21.12).abs() < 1e-6);
+
+        let (name, data) = db.find_model("BLACKMAGIC", "BMCC 6K").unwrap();
+        assert_eq!(name, "BMCC 6K");
+        assert!((data.sw - 36.0).abs() < 1e-6);
+    }
+
     fn z8_columns(with_nraw_col: bool) -> Vec<String> {
         let mut cols: Vec<String> = vec![
             "8K60","8K30","8K24",
