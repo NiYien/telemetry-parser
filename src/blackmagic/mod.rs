@@ -699,12 +699,19 @@ impl BlackmagicBraw {
                     let sensor_w = model_data.sw;
 
                     // Use SensorAreaCaptured width if available (handles crop implicitly),
-                    // otherwise compute effective sensor width from max_resolution_w (ref NiYien Tool bmd.cpp)
+                    // otherwise compute effective sensor width from max_resolution_w (ref NiYien Tool bmd.cpp).
+                    // Scale whenever max_res is known, not only for resolution_w < max_res:
+                    // upfl then reduces to max_res / sensor_w for any recorded width.
+                    // CinemaDNG frames read out overscan (BMPCC records 1952 px while its
+                    // 12.48 mm covers the 1920 active columns); the old strict-less-than
+                    // skipped scaling there and overstated upfl by that overscan ratio.
+                    // resolution_w == max_res makes both forms identical, and MOV never
+                    // records wider than max_res, so this only changes the overscan case.
                     let effective_sensor_w = if let Some(captured_w) = sensor_area_captured_w {
                         captured_w as f64
                     } else if resolution_w > 0 {
                         let max_res = Self::max_resolution_w(model_name);
-                        if max_res > 0 && resolution_w < max_res {
+                        if max_res > 0 {
                             sensor_w as f64 * resolution_w as f64 / max_res as f64
                         } else {
                             sensor_w as f64
@@ -1057,24 +1064,48 @@ mod tests {
         d.extend_from_slice(&val.to_le_bytes());
     }
 
-    fn synthetic_bmcc_dng() -> Vec<u8> {
+    fn synthetic_dng(model: &str, width: u32, height: u32) -> Vec<u8> {
         // Minimal little-endian TIFF: IFD0 with ImageWidth (LONG), ImageLength
         // (SHORT, to exercise both scalar types) and UniqueCameraModel (ASCII,
         // indirect). header(8) + count(2) + 3*12 + next(4) = 50.
-        let model = b"Blackmagic Cinema Camera\0";
+        let mut model_z = model.as_bytes().to_vec();
+        model_z.push(0);
         let str_offset = 50u32;
         let mut d = Vec::new();
         d.extend_from_slice(b"II");
         d.extend_from_slice(&42u16.to_le_bytes());
         d.extend_from_slice(&8u32.to_le_bytes());
         d.extend_from_slice(&3u16.to_le_bytes());
-        push_ifd_entry(&mut d, 0x0100, 4, 1, 2432);                        // ImageWidth
-        push_ifd_entry(&mut d, 0x0101, 3, 1, 1366);                        // ImageLength
-        push_ifd_entry(&mut d, 0xC614, 2, model.len() as u32, str_offset); // UniqueCameraModel
+        push_ifd_entry(&mut d, 0x0100, 4, 1, width);                         // ImageWidth
+        push_ifd_entry(&mut d, 0x0101, 3, 1, height);                        // ImageLength
+        push_ifd_entry(&mut d, 0xC614, 2, model_z.len() as u32, str_offset); // UniqueCameraModel
         d.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(d.len(), str_offset as usize);
-        d.extend_from_slice(model);
+        d.extend_from_slice(&model_z);
         d
+    }
+
+    fn parse_synthetic_dng(bytes: &[u8], db_json: &str, db_dir_name: &str) -> (BlackmagicBraw, Vec<SampleInfo>) {
+        let db_dir = std::env::temp_dir().join(db_dir_name);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::write(db_dir.join("blackmagic.json"), db_json).unwrap();
+        let options = crate::InputOptions {
+            camera_db_path: Some(db_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        assert!(BlackmagicBraw::detect(bytes, "test.dng", &options).is_some(), "synthetic DNG must pass detect");
+        let mut bmd = BlackmagicBraw::default();
+        let mut stream = Cursor::new(bytes);
+        let samples = bmd.parse(&mut stream, bytes.len(), |_| (), Arc::new(AtomicBool::new(false)), options)
+            .expect("TIFF input must not error out of parse_non_braw");
+        (bmd, samples)
+    }
+
+    fn upfl_of(samples: &[SampleInfo]) -> f64 {
+        let map = samples.first().and_then(|s| s.tag_map.as_ref()).expect("tag map must survive");
+        *(map.get(&GroupId::Lens)
+            .and_then(|m| m.get_t(TagId::Custom("unit_pixel_focal_length".into())) as Option<&f64>)
+            .expect("upfl must be emitted"))
     }
 
     #[test]
@@ -1083,29 +1114,33 @@ mod tests {
         // resolution_w stays 0, so the camera_db block never emits upfl; and
         // without the is_tiff guard, get_metadata_track_samples errors out and
         // the whole tag map is discarded (samples=None at the caller).
-        let db_dir = std::env::temp_dir().join("tp-test-camera-db-bmcc25k");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        std::fs::write(db_dir.join("blackmagic.json"),
-            r#"{ "version": 1, "aliases": {}, "models": { "BMCC": { "sw": 15.81 } } }"#).unwrap();
-
-        let bytes = synthetic_bmcc_dng();
-        let options = crate::InputOptions {
-            camera_db_path: Some(db_dir.to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-        assert!(BlackmagicBraw::detect(&bytes, "test.dng", &options).is_some(), "synthetic DNG must pass detect");
-
-        let mut bmd = BlackmagicBraw::default();
-        let mut stream = Cursor::new(&bytes);
-        let samples = bmd.parse(&mut stream, bytes.len(), |_| (), Arc::new(AtomicBool::new(false)), options)
-            .expect("TIFF input must not error out of parse_non_braw");
+        let bytes = synthetic_dng("Blackmagic Cinema Camera", 2432, 1366);
+        let (bmd, samples) = parse_synthetic_dng(&bytes,
+            r#"{ "version": 1, "aliases": {}, "models": { "BMCC": { "sw": 15.81 } } }"#,
+            "tp-test-camera-db-bmcc25k");
 
         assert_eq!(bmd.model.as_deref(), Some("BMCC"));
-        let map = samples.first().and_then(|s| s.tag_map.as_ref()).expect("tag map must survive");
-        let upfl: f64 = *(map.get(&GroupId::Lens)
-            .and_then(|m| m.get_t(TagId::Custom("unit_pixel_focal_length".into())) as Option<&f64>)
-            .expect("upfl must be emitted"));
+        let upfl = upfl_of(&samples);
+        // Recorded width == max_resolution_w, so upfl reduces to max_res / sw.
         let expected = 2432.0 / 15.81f32 as f64;
+        assert!((upfl - expected).abs() < 1e-6, "upfl = {upfl}, expected ~{expected}");
+    }
+
+    #[test]
+    fn cinemadng_overscan_readout_still_yields_the_sensor_scale() {
+        // BMPCC CinemaDNG records 1952 px overscan while the 12.48 mm sensor
+        // width covers the 1920 active columns (verified on real footage).
+        // upfl must stay max_res / sw regardless of the recorded width; the old
+        // strict-less-than scaling condition overstated it by the overscan
+        // ratio (156.41 instead of 153.85).
+        let bytes = synthetic_dng("Blackmagic Pocket Cinema Camera", 1952, 1112);
+        let (bmd, samples) = parse_synthetic_dng(&bytes,
+            r#"{ "version": 1, "aliases": {}, "models": { "BMPCC": { "sw": 12.48 } } }"#,
+            "tp-test-camera-db-bmpcc-overscan");
+
+        assert_eq!(bmd.model.as_deref(), Some("BMPCC"));
+        let upfl = upfl_of(&samples);
+        let expected = 1920.0 / 12.48f32 as f64;
         assert!((upfl - expected).abs() < 1e-6, "upfl = {upfl}, expected ~{expected}");
     }
 }
