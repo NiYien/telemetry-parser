@@ -77,6 +77,12 @@ pub struct InputOptions {
     /// focal_length / fl_35mm_equiv and nearest-neighbor ISO / shutter / aperture.
     /// Trade-off: smaller N = more accurate per-frame data but slower I/O on HDD.
     pub metadata_sample_stride: Option<usize>,
+    /// Caller-supplied video frame rate, used only as a fallback for camera_db
+    /// table lookups (crop / readout segmentation) when the file itself carries
+    /// no frame rate — e.g. CinemaDNG image sequences parsed from a single
+    /// frame. It never produces a FrameRate tag: the parser must not report
+    /// metadata the container does not contain.
+    pub video_fps: Option<f64>,
 }
 
 macro_rules! impl_formats {

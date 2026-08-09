@@ -681,14 +681,23 @@ impl BlackmagicBraw {
             resolution_w = tiff_width;
             resolution_h = tiff_height;
         }
-        let fps = video_md.as_ref().map(|v| v.fps).unwrap_or(0.0);
-        if fps > 0.0 {
-            util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:?}", v), fps, vec![]), &options);
+        let container_fps = video_md.as_ref().map(|v| v.fps).unwrap_or(0.0);
+        if container_fps > 0.0 {
+            util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:?}", v), container_fps, vec![]), &options);
         } else if let Some(v) = md.get("com.blackmagic-design.projectFPS").and_then(|v| v.as_i64()) {
             if v > 0 {
                 util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:?}", v), v as f64, vec![]), &options);
             }
         }
+        // Table-lookup fps: single-frame TIFF/DNG carries no frame rate, so the
+        // caller-supplied value is the only way the fps-segmented camera_db
+        // tables (crop / readout) can resolve a column. Lookup only -- the
+        // FrameRate tag above stays container-sourced.
+        let fps = if container_fps > 0.0 {
+            container_fps
+        } else {
+            options.video_fps.filter(|v| *v > 0.0).unwrap_or(0.0)
+        };
 
         // camera_db integration
         if let Some(db_path) = &options.camera_db_path {
@@ -1085,12 +1094,13 @@ mod tests {
         d
     }
 
-    fn parse_synthetic_dng(bytes: &[u8], db_json: &str, db_dir_name: &str) -> (BlackmagicBraw, Vec<SampleInfo>) {
+    fn parse_synthetic_dng(bytes: &[u8], db_json: &str, db_dir_name: &str, video_fps: Option<f64>) -> (BlackmagicBraw, Vec<SampleInfo>) {
         let db_dir = std::env::temp_dir().join(db_dir_name);
         std::fs::create_dir_all(&db_dir).unwrap();
         std::fs::write(db_dir.join("blackmagic.json"), db_json).unwrap();
         let options = crate::InputOptions {
             camera_db_path: Some(db_dir.to_string_lossy().into_owned()),
+            video_fps,
             ..Default::default()
         };
         assert!(BlackmagicBraw::detect(bytes, "test.dng", &options).is_some(), "synthetic DNG must pass detect");
@@ -1117,13 +1127,57 @@ mod tests {
         let bytes = synthetic_dng("Blackmagic Cinema Camera", 2432, 1366);
         let (bmd, samples) = parse_synthetic_dng(&bytes,
             r#"{ "version": 1, "aliases": {}, "models": { "BMCC": { "sw": 15.81 } } }"#,
-            "tp-test-camera-db-bmcc25k");
+            "tp-test-camera-db-bmcc25k", None);
 
         assert_eq!(bmd.model.as_deref(), Some("BMCC"));
         let upfl = upfl_of(&samples);
         // Recorded width == max_resolution_w, so upfl reduces to max_res / sw.
         let expected = 2432.0 / 15.81f32 as f64;
         assert!((upfl - expected).abs() < 1e-6, "upfl = {upfl}, expected ~{expected}");
+    }
+
+    const BMCC_DB_WITH_READOUT: &str = r#"{
+        "version": 1, "aliases": {},
+        "models": { "BMCC": { "sw": 15.81 } },
+        "readout": {
+            "columns": ["1K30", "1K24"],
+            "data": { "BMCC": [-25, -25] }
+        }
+    }"#;
+
+    #[test]
+    fn cinemadng_readout_lookup_uses_the_caller_supplied_fps() {
+        // A single DNG frame carries no frame rate, so without the caller's fps
+        // the fps-segmented readout table can never resolve a column. The
+        // negative table value is the low-confidence convention (abs() on read).
+        let bytes = synthetic_dng("Blackmagic Cinema Camera", 2432, 1366);
+        let (bmd, samples) = parse_synthetic_dng(&bytes, BMCC_DB_WITH_READOUT,
+            "tp-test-camera-db-bmcc25k-ro", Some(30.0));
+
+        assert_eq!(bmd.frame_readout_time, Some(25.0));
+        let map = samples.first().and_then(|s| s.tag_map.as_ref()).unwrap();
+        let ro: f64 = *(map.get(&GroupId::Imager)
+            .and_then(|m| m.get_t(TagId::FrameReadoutTime) as Option<&f64>)
+            .expect("readout tag must be emitted"));
+        assert!((ro - 25.0).abs() < 1e-9);
+        // The FrameRate tag must stay container-sourced: the fallback fps is
+        // for table lookups only, and a DNG frame has no container frame rate.
+        assert!(map.get(&GroupId::Default).map_or(true, |m| (m.get_t(TagId::FrameRate) as Option<&f64>).is_none()),
+            "caller fps must not fabricate a FrameRate tag");
+    }
+
+    #[test]
+    fn cinemadng_readout_lookup_stays_empty_without_caller_fps() {
+        let bytes = synthetic_dng("Blackmagic Cinema Camera", 2432, 1366);
+        let (bmd, samples) = parse_synthetic_dng(&bytes, BMCC_DB_WITH_READOUT,
+            "tp-test-camera-db-bmcc25k-nofps", None);
+
+        assert_eq!(bmd.frame_readout_time, None);
+        let map = samples.first().and_then(|s| s.tag_map.as_ref()).unwrap();
+        assert!(map.get(&GroupId::Imager).map_or(true, |m| (m.get_t(TagId::FrameReadoutTime) as Option<&f64>).is_none()));
+        // upfl is fps-independent and must still be there.
+        let upfl = upfl_of(&samples);
+        assert!((upfl - 2432.0 / 15.81f32 as f64).abs() < 1e-6);
     }
 
     #[test]
@@ -1136,7 +1190,7 @@ mod tests {
         let bytes = synthetic_dng("Blackmagic Pocket Cinema Camera", 1952, 1112);
         let (bmd, samples) = parse_synthetic_dng(&bytes,
             r#"{ "version": 1, "aliases": {}, "models": { "BMPCC": { "sw": 12.48 } } }"#,
-            "tp-test-camera-db-bmpcc-overscan");
+            "tp-test-camera-db-bmpcc-overscan", None);
 
         assert_eq!(bmd.model.as_deref(), Some("BMPCC"));
         let upfl = upfl_of(&samples);
