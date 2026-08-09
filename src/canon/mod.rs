@@ -1032,12 +1032,89 @@ pub fn parse_tags(data: &[u8], options: &crate::InputOptions, map: &mut GroupedT
 //
 // HDD wall time on 39 GB R5 C MXF: 200 s -> ~65-80 s (verified via Python POC)
 
+// Lower bound of the front read window, not the window itself. Canon reserves an index
+// region sized to the clip length and rounds it up to a power-of-two boundary, which pushes
+// the first essence element past any fixed threshold on long clips (measured: a 41.9 min
+// R5 C clip reserves 4185088 index bytes, landing essence at byte 4194816 — 512 bytes past
+// this constant). The real window is computed from the Header Partition Pack by
+// `canon_mxf_front_window`; this value only guarantees the window never shrinks below what
+// previously-working files already read.
 const CANON_MXF_FAST_FRONT_BYTES: usize = 4 * 1024 * 1024;
+// Upper bound, so a corrupt or hostile partition pack cannot request an unbounded allocation.
+const CANON_MXF_FAST_FRONT_MAX: usize = 64 * 1024 * 1024;
+// Covers the system metadata pack, vendor metadata and KLV fill items that sit between the
+// end of the index region and the first essence element (measured: 512 bytes).
+const CANON_MXF_FAST_ESSENCE_MARGIN: usize = 64 * 1024;
+// Bytes read to probe the Header Partition Pack before sizing the real front window.
+const CANON_MXF_FAST_PACK_PROBE_BYTES: usize = 4096;
 const CANON_MXF_FAST_EU0_BYTES: usize = 4 * 1024 * 1024;
 const CANON_MXF_FAST_READ_WINDOW: usize = 800;
 const CANON_MXF_FAST_SEEK_BACKOFF: u64 = 200;
 const CANON_MXF_FAST_EARLY_TERM_FOCAL_MM: f32 = 5.0;
 const CANON_MXF_FAST_EARLY_TERM_CONSECUTIVE: usize = 5;
+
+// Fields of an MXF Header Partition Pack that determine where essence begins.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MxfPartitionPack {
+    pub kag: u32,
+    pub header_byte_count: u64,
+    pub index_byte_count: u64,
+    // End offset of the partition pack KLV itself (key + BER + value).
+    pub pack_end: usize,
+}
+
+// Parse the Header Partition Pack at offset 0. Returns None for anything that is not a
+// well-formed header partition pack; callers must treat None as "fall back to the fixed
+// window", never as a parse failure.
+pub(crate) fn parse_mxf_partition_pack(front: &[u8]) -> Option<MxfPartitionPack> {
+    // 06 0E 2B 34 02 05 01 01 0D 01 02 01 01 <kind> <status> 00, kind 0x02 = Header
+    const PARTITION_PREFIX: [u8; 13] = [0x06, 0x0E, 0x2B, 0x34, 0x02, 0x05, 0x01, 0x01,
+                                        0x0D, 0x01, 0x02, 0x01, 0x01];
+    if front.len() < 16 || front[..13] != PARTITION_PREFIX { return None; }
+    if front[13] != 0x02 { return None; } // header partition only
+    if front[15] != 0x00 { return None; }
+
+    let (length, ber_size) = read_ber_buf(&front[16..])?;
+    let val_start = 16 + ber_size;
+    let val_end = val_start.checked_add(length as usize)?;
+    if length < 64 || val_end > front.len() { return None; }
+    let val = &front[val_start..val_start + 64];
+
+    let be32 = |o: usize| u32::from_be_bytes([val[o], val[o + 1], val[o + 2], val[o + 3]]);
+    let be64 = |o: usize| u64::from_be_bytes([val[o], val[o + 1], val[o + 2], val[o + 3],
+                                              val[o + 4], val[o + 5], val[o + 6], val[o + 7]]);
+    // major(u16) minor(u16) kag(u32) this(u64) prev(u64) footer(u64)
+    // header_byte_count(u64) index_byte_count(u64) index_sid(u32) body_offset(u64) body_sid(u32)
+    Some(MxfPartitionPack {
+        kag: be32(4),
+        header_byte_count: be64(32),
+        index_byte_count: be64(40),
+        pack_end: val_end,
+    })
+}
+
+// Size the front read window so it always reaches past the index region into essence.
+// Only ever grows the legacy window: files that already parsed keep reading the same bytes.
+pub(crate) fn canon_mxf_front_window(pack: Option<&MxfPartitionPack>) -> usize {
+    let window = (|| {
+        let p = pack?;
+        // KAG 0 is invalid and 1 means no alignment; both skip the round-up (and 0 would
+        // divide by zero).
+        let aligned_pack_end = if p.kag > 1 {
+            let kag = p.kag as usize;
+            p.pack_end.checked_add(kag - 1)? / kag * kag
+        } else {
+            p.pack_end
+        };
+        let header = usize::try_from(p.header_byte_count).ok()?;
+        let index = usize::try_from(p.index_byte_count).ok()?;
+        aligned_pack_end.checked_add(header)?
+                        .checked_add(index)?
+                        .checked_add(CANON_MXF_FAST_ESSENCE_MARGIN)
+    })().unwrap_or(CANON_MXF_FAST_FRONT_BYTES);
+
+    window.clamp(CANON_MXF_FAST_FRONT_BYTES, CANON_MXF_FAST_FRONT_MAX)
+}
 
 fn read_ber_buf(data: &[u8]) -> Option<(u64, usize)> {
     if data.is_empty() { return None; }
@@ -1232,6 +1309,34 @@ fn interpolate_canvas_frame(samples: &[(usize, MxfCanvasFrame)], frame_idx: usiz
     }
 }
 
+// Degraded return for a Canon MXF whose essence layout the fast path cannot navigate.
+//
+// The placeholder sample is load-bearing, not cosmetic. `process_map` assigns `self.model`
+// only while iterating `samples`, and the creation date is written only through
+// `samples.first_mut()` — so returning an empty vector would silently drop both the model and
+// the creation time this function just went to the trouble of preserving, leaving the caller
+// in exactly the failed state the degraded path exists to avoid. Same shape as the existing
+// "No Canvas frames, just write model name" branch in `parse`.
+fn mxf_partial_result(
+    model_name: Option<String>,
+    creation_time: Option<String>,
+    creation_subsec: Option<String>,
+    video_md: Option<util::VideoMetadata>,
+    options: &crate::InputOptions,
+) -> (Vec<SampleInfo>, Option<String>, Option<String>, Option<util::VideoMetadata>) {
+    let mut map = GroupedTagMap::new();
+    if let Some(ref m) = model_name {
+        let model_clean = m.strip_prefix("Canon ").unwrap_or(m).to_string();
+        util::insert_tag(
+            &mut map,
+            tag!(parsed GroupId::Default, TagId::Name, "Camera model", String, |v| v.to_string(), model_clean, Vec::new()),
+            options,
+        );
+    }
+    let samples = vec![SampleInfo { tag_map: Some(map), ..Default::default() }];
+    (samples, creation_time, creation_subsec, video_md)
+}
+
 // Single-pass Canon MXF parse using Index Table sparse seeks.
 // Returns: (samples, creation_time, creation_subsec, video_metadata)
 pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
@@ -1241,9 +1346,22 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
     progress_cb: &F,
     cancel_flag: Arc<AtomicBool>,
 ) -> Result<(Vec<SampleInfo>, Option<String>, Option<String>, Option<util::VideoMetadata>)> {
-    // Step 1: read front 4 MiB
+    // Step 1: probe the Header Partition Pack, then read a front window sized from what it
+    // declares. A fixed window breaks on long clips: Canon reserves an index region scaled to
+    // the clip length and rounds it up to a power-of-two boundary, so essence can start past
+    // any constant threshold.
     stream.seek(SeekFrom::Start(0))?;
-    let front_size = CANON_MXF_FAST_FRONT_BYTES.min(size.max(1));
+    let probe_size = CANON_MXF_FAST_PACK_PROBE_BYTES.min(size.max(1));
+    let mut probe = vec![0u8; probe_size];
+    stream.read_exact(&mut probe)?;
+    let pack = parse_mxf_partition_pack(&probe);
+    let front_size = canon_mxf_front_window(pack.as_ref()).min(size.max(1));
+    log::debug!(
+        "Canon MXF fast path: front_window={} pack={:?}",
+        front_size, pack
+    );
+
+    stream.seek(SeekFrom::Start(0))?;
     let mut front = vec![0u8; front_size];
     stream.read_exact(&mut front)?;
 
@@ -1332,23 +1450,29 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
         }
     }
 
-    let essence_start = essence_start.ok_or_else(|| Error::new(
-        ErrorKind::InvalidData,
-        format!("Canon MXF fast path: essence_start not found in first {} MiB", CANON_MXF_FAST_FRONT_BYTES / 1024 / 1024),
-    ))?;
+    // Structural failures below degrade to a partial result rather than an error: the header
+    // metadata is already in hand, and discarding it takes creation time, camera model and
+    // video metadata down with it (which is what made long clips report "no gyro data").
+    // I/O failures keep propagating — a bad read must not masquerade as a successful parse.
+    let essence_start = match essence_start {
+        Some(v) => v,
+        None => {
+            log::warn!("Canon MXF fast path: essence_start not found in first {} bytes, returning partial metadata", front_size);
+            return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, video_md, options));
+        }
+    };
 
     if eu_offsets.len() < 2 {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("Canon MXF fast path: Index Table has {} entries, need at least 2", eu_offsets.len()),
-        ));
+        log::warn!("Canon MXF fast path: Index Table has {} entries, need at least 2, returning partial metadata", eu_offsets.len());
+        return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, video_md, options));
     }
 
     // Step 3: locate Canvas in EU[0]
     let eu0_avail = (size as u64).saturating_sub(essence_start) as usize;
     let eu0_size = CANON_MXF_FAST_EU0_BYTES.min(eu0_avail);
     if eu0_size == 0 {
-        return Err(Error::new(ErrorKind::InvalidData, "Canon MXF fast path: no essence bytes available"));
+        log::warn!("Canon MXF fast path: no essence bytes available, returning partial metadata");
+        return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, video_md, options));
     }
     let mut eu0 = vec![0u8; eu0_size];
     stream.seek(SeekFrom::Start(essence_start))?;
@@ -1358,17 +1482,18 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
         0x06, 0x0E, 0x2B, 0x34, 0x02, 0x43, 0x01, 0x01,
         0x0D, 0x01, 0x03, 0x01, 0x04, 0x01, 0x02, 0x03,
     ];
-    let canvas_pos_in_eu0 = memmem::find(&eu0, &canvas_key).ok_or_else(|| Error::new(
-        ErrorKind::InvalidData,
-        format!("Canon MXF fast path: Canvas Container not found in first {} MiB of essence", CANON_MXF_FAST_EU0_BYTES / 1024 / 1024),
-    ))?;
+    let canvas_pos_in_eu0 = match memmem::find(&eu0, &canvas_key) {
+        Some(v) => v,
+        None => {
+            log::warn!("Canon MXF fast path: Canvas Container not found in first {} MiB of essence, returning partial metadata", CANON_MXF_FAST_EU0_BYTES / 1024 / 1024);
+            return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, video_md, options));
+        }
+    };
 
     let eu1_offset = eu_offsets[1];
     if eu1_offset as usize <= canvas_pos_in_eu0 {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("Canon MXF fast path: Canvas pos {} >= EU[1] offset {}", canvas_pos_in_eu0, eu1_offset),
-        ));
+        log::warn!("Canon MXF fast path: Canvas pos {} >= EU[1] offset {}, returning partial metadata", canvas_pos_in_eu0, eu1_offset);
+        return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, video_md, options));
     }
     let canvas_dist_from_next_eu = eu1_offset - canvas_pos_in_eu0 as u64;
 
@@ -1462,6 +1587,175 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Canon MXF fast path front window ──
+
+    // Build a synthetic Header Partition Pack: 16-byte key, 4-byte BER, 64-byte value block.
+    fn make_pack(kag: u32, header_bytes: u64, index_bytes: u64) -> Vec<u8> {
+        let mut v = vec![0x06, 0x0E, 0x2B, 0x34, 0x02, 0x05, 0x01, 0x01,
+                         0x0D, 0x01, 0x02, 0x01, 0x01, 0x02, 0x04, 0x00];
+        v.extend_from_slice(&[0x83, 0x00, 0x00, 0x64]); // BER long form, length 100
+        let mut val = vec![0u8; 100];
+        val[4..8].copy_from_slice(&kag.to_be_bytes());
+        val[32..40].copy_from_slice(&header_bytes.to_be_bytes());
+        val[40..48].copy_from_slice(&index_bytes.to_be_bytes());
+        v.extend_from_slice(&val);
+        v
+    }
+
+    #[test]
+    fn mxf_front_window_covers_c285_essence_start() {
+        // A030C285.MXF (41.9 min R5 C, 150840 frames): the index reservation is rounded up to
+        // a 4 MiB boundary, putting the first essence element at byte 4194816 — 512 bytes past
+        // the legacy fixed window, which is exactly why the whole parse used to fail.
+        let buf = make_pack(512, 8704, 4185088);
+        let pack = parse_mxf_partition_pack(&buf).unwrap();
+        assert_eq!(pack.kag, 512);
+        assert_eq!(pack.header_byte_count, 8704);
+        assert_eq!(pack.index_byte_count, 4185088);
+
+        let window = canon_mxf_front_window(Some(&pack));
+        assert!(window > 4194816, "window {} must reach past essence start 4194816", window);
+        // 512 (pack end aligned to KAG) + 8704 + 4185088 + 64 KiB margin
+        assert_eq!(window, 512 + 8704 + 4185088 + 64 * 1024);
+    }
+
+    #[test]
+    fn mxf_partition_pack_parses_real_c285_bytes() {
+        // First 160 bytes of A030C285.MXF. A synthetic pack only proves the arithmetic; this
+        // proves the field offsets match what an R5 C actually writes.
+        const C285_HEAD: [u8; 160] = [
+            0x06, 0x0E, 0x2B, 0x34, 0x02, 0x05, 0x01, 0x01, 0x0D, 0x01, 0x02, 0x01,
+            0x01, 0x02, 0x04, 0x00, 0x83, 0x00, 0x00, 0x78, 0x00, 0x01, 0x00, 0x03,
+            0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12,
+            0xC2, 0xE7, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0xDC, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x01, 0x0D, 0x01, 0x02, 0x01,
+            0x01, 0x01, 0x09, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x10,
+            0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0A, 0x0D, 0x01, 0x03, 0x01,
+            0x02, 0x10, 0x60, 0x01, 0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x01,
+            0x0D, 0x01, 0x03, 0x01, 0x02, 0x06, 0x03, 0x00, 0x06, 0x0E, 0x2B, 0x34,
+            0x01, 0x01, 0x01, 0x02, 0x03, 0x01, 0x02, 0x10, 0x01, 0x00, 0x00, 0x00,
+            0x83, 0x00, 0x01, 0x60,
+        ];
+        let pack = parse_mxf_partition_pack(&C285_HEAD).expect("real Canon header partition pack");
+        assert_eq!(pack.kag, 512);
+        assert_eq!(pack.header_byte_count, 8704);
+        assert_eq!(pack.index_byte_count, 4185088);
+        assert_eq!(pack.pack_end, 140); // 16 key + 4 BER + 120 value
+        // 4194816 is where the essence element actually sits in this file.
+        assert!(canon_mxf_front_window(Some(&pack)) > 4194816);
+    }
+
+    // End-to-end walk over the real 8 MiB head slice of A030C285.MXF. The slice is too large
+    // to commit, so this is opt-in:
+    //   CANON_MXF_C285_HEAD=<path> cargo test --lib c285_head_slice -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn mxf_fast_path_reaches_essence_in_c285_head_slice() {
+        let path = match std::env::var("CANON_MXF_C285_HEAD") {
+            Ok(p) => p,
+            Err(_) => { eprintln!("set CANON_MXF_C285_HEAD to the 8 MiB head slice"); return; }
+        };
+        let buf = std::fs::read(&path).expect("read head slice");
+        assert_eq!(buf.len(), 8 * 1024 * 1024, "expected an 8 MiB head slice");
+
+        let pack = parse_mxf_partition_pack(&buf).expect("header partition pack");
+        let window = canon_mxf_front_window(Some(&pack));
+        assert!(window > 4194816 && window <= buf.len(),
+                "window {} must reach essence at 4194816 and fit the slice", window);
+
+        // Replay the fast path's KLV walk over exactly the bytes it would read.
+        let front = &buf[..window];
+        let mut i = 0usize;
+        let mut essence_start = None;
+        let mut eu_offsets: Vec<u64> = Vec::new();
+        while i + 16 < front.len() {
+            if &front[i..i + 4] != &[0x06, 0x0E, 0x2B, 0x34] { i += 1; continue; }
+            let key = &front[i..i + 16];
+            let (length, ber_size) = match read_ber_buf(&front[i + 16..]) { Some(x) => x, None => break };
+            let val_start = i + 16 + ber_size;
+            let val_end = match val_start.checked_add(length as usize) { Some(v) => v, None => break };
+            let is_essence = key[4] == 0x01
+                && (key[12] == 0x14 || key[12] == 0x15 || key[12] == 0x16 || key[12] == 0x17 || key[12] == 0x18);
+            if is_essence { essence_start = Some(i as u64); break; }
+            if val_end > front.len() { break; }
+            if key == &[0x06, 0x0E, 0x2B, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0D, 0x01, 0x02, 0x01, 0x01, 0x10, 0x01, 0x00] {
+                parse_index_table_segment(&front[val_start..val_end], &mut eu_offsets);
+            }
+            i = val_end;
+        }
+        assert_eq!(essence_start, Some(4194816), "essence element must be reached");
+        assert_eq!(eu_offsets.len(), 150840, "every edit unit of the clip must be indexed");
+    }
+
+    #[test]
+    fn mxf_front_window_never_below_legacy_bound() {
+        // A006C240 (short clip, index rounded to 2 MiB): already parsed fine before this
+        // change, so it must keep reading the same number of bytes it always did.
+        let short = parse_mxf_partition_pack(&make_pack(512, 8704, 2087936)).unwrap();
+        assert_eq!(canon_mxf_front_window(Some(&short)), CANON_MXF_FAST_FRONT_BYTES);
+        // No pack at all falls back to the legacy window rather than failing.
+        assert_eq!(canon_mxf_front_window(None), CANON_MXF_FAST_FRONT_BYTES);
+    }
+
+    #[test]
+    fn mxf_front_window_clamps_at_upper_bound() {
+        let huge = parse_mxf_partition_pack(&make_pack(512, 8704, 1 << 40)).unwrap();
+        assert_eq!(canon_mxf_front_window(Some(&huge)), CANON_MXF_FAST_FRONT_MAX);
+    }
+
+    #[test]
+    fn mxf_partition_pack_rejects_malformed_input() {
+        // Not a partition pack key at all
+        assert!(parse_mxf_partition_pack(&[0u8; 128]).is_none());
+        // Footer partition (kind 0x04) must not be mistaken for the header partition
+        let mut footer = make_pack(512, 8704, 0);
+        footer[13] = 0x04;
+        assert!(parse_mxf_partition_pack(&footer).is_none());
+        // Value block truncated below the 64-byte fixed field area
+        let short = make_pack(512, 8704, 0);
+        assert!(parse_mxf_partition_pack(&short[..70]).is_none());
+        // Truncated buffer that cannot even hold the key
+        assert!(parse_mxf_partition_pack(&short[..8]).is_none());
+        // BER announces 8 length bytes that are not present
+        let mut bad_ber = short.clone();
+        bad_ber.truncate(20);
+        bad_ber[16] = 0x88;
+        assert!(parse_mxf_partition_pack(&bad_ber).is_none());
+    }
+
+    #[test]
+    fn mxf_front_window_survives_degenerate_kag() {
+        // KAG 0 is invalid and KAG 1 means no alignment; neither may divide by zero.
+        for kag in [0u32, 1] {
+            let pack = parse_mxf_partition_pack(&make_pack(kag, 8704, 4185088)).unwrap();
+            let window = canon_mxf_front_window(Some(&pack));
+            assert!(window >= CANON_MXF_FAST_FRONT_BYTES && window <= CANON_MXF_FAST_FRONT_MAX);
+        }
+    }
+
+    #[test]
+    fn mxf_partial_result_carries_model_and_exactly_one_sample() {
+        let opts = crate::InputOptions::default();
+        // The placeholder sample is what lets `process_map` recover the model and land the
+        // creation date; an empty vector would discard both.
+        let (samples, ct, cs, _) = mxf_partial_result(
+            Some("Canon C500 Mark II".into()), Some("2025-08-05 17:48:25".into()), Some("500".into()), None, &opts);
+        assert_eq!(samples.len(), 1);
+        let map = samples[0].tag_map.as_ref().unwrap();
+        let name = map.get(&GroupId::Default).and_then(|m| m.get(&TagId::Name)).unwrap();
+        assert_eq!(name.value.to_string(), "C500 Mark II");
+        assert_eq!(ct.as_deref(), Some("2025-08-05 17:48:25"));
+        assert_eq!(cs.as_deref(), Some("500"));
+
+        // Without a model there is still one sample, so the creation date keeps its landing spot.
+        let (samples, ..) = mxf_partial_result(None, Some("2025-08-05 17:48:25".into()), None, None, &opts);
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].tag_map.is_some());
+    }
 
     #[test]
     fn test_detect_powershot() {

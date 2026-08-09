@@ -125,10 +125,18 @@ macro_rules! impl_formats {
                     }
                     if check {
                         if let Some(mut x) = <$class>::detect(&buf, &filepath, &options) {
-                            return Ok(Input {
-                                samples: x.parse(stream, size, progress_cb, cancel_flag, options).ok(),
-                                inner: SupportedFormats::$name(x)
-                            });
+                            // A parser that claimed the file but then failed to parse it is worth
+                            // a line. The samples are dropped either way, and swallowing the error
+                            // silently has twice left a metadata regression with no trace at all.
+                            let samples = match x.parse(stream, size, progress_cb, cancel_flag, options) {
+                                Ok(v) => Some(v),
+                                Err(e) => {
+                                    log::warn!("{} parser claimed {:?} but failed to parse it: {}",
+                                               stringify!($name), filepath.as_ref(), e);
+                                    None
+                                }
+                            };
+                            return Ok(Input { samples, inner: SupportedFormats::$name(x) });
                         }
                     }
                 )*}
