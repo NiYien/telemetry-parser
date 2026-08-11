@@ -317,12 +317,34 @@ impl CameraDatabase {
                         break;
                     }
                 }
-                if value.is_none() {
+                let from_nraw_column = value.is_some();
+                // The scaling estimate models a binned/line-skipped scan, so it must only
+                // run when the ratio is an integer line-division factor. An oversampled
+                // scan (all crop-area lines read, then downscaled) keeps the full readout
+                // time, so leaving `value` unset lets it fall through to the standard
+                // column below. A dedicated N-RAW column above is a measured value and
+                // deliberately bypasses this check.
+                let binned = is_integer_line_division(ratio);
+                if value.is_none() && binned {
                     if let Some(t_full) = full_scan_reference(&readout.columns, row, fps) {
                         value = Some(t_full * ratio);
                         is_estimated = true;
                     }
                 }
+                log::debug!(
+                    "N-RAW scan: model={} ratio={:.6} lines_per_output={:.5} class={} source={}",
+                    model,
+                    ratio,
+                    1.0 / ratio,
+                    if binned { "binning" } else { "oversampled" },
+                    if from_nraw_column {
+                        "nraw_column"
+                    } else if value.is_some() {
+                        "scaled_estimate"
+                    } else {
+                        "standard_column"
+                    }
+                );
             }
         }
 
@@ -459,6 +481,32 @@ fn fps_fallback(suffix: &str) -> &'static [&'static str] {
 /// binned/line-skipped (subsampled) scan; at or above it, a full-area scan.
 /// 2x2-binned N-RAW ≈ 0.50, full-area N-RAW ≈ 1.0 — both far from the threshold.
 const NRAW_SUBSAMPLED_RATIO_MAX: f64 = 0.75;
+
+/// Tolerance, in units of "sensor lines per output line", for accepting a ratio as an
+/// integer line-division factor.
+///
+/// NOT a tuned value: it is the midpoint between the two clusters seen in real captures.
+/// Measured `1/ratio`: Z 8 / Z 9 4.1K N-RAW = 2.00517 (deviation 0.005), ZR / Z6III 4K
+/// N-RAW = 1.50617 and 1.50087 (deviation 0.494). Any value in roughly [0.01, 0.3]
+/// classifies every known capture identically — do not "refine" it without new samples.
+const NRAW_LINE_DIVISION_TOLERANCE: f64 = 0.05;
+
+/// True when `ratio` (output lines / crop-area lines) corresponds to combining an integer
+/// number of sensor lines into one output line.
+///
+/// Binning and line-skipping are physically constrained to "n sensor lines -> 1 output
+/// line" with integer n, so a subsampled scan always yields `1/ratio ≈ n`. A ratio that
+/// misses every integer indicates an oversampled scan — every line of the crop area is
+/// read out and the result is downscaled — whose readout time is NOT shortened.
+fn is_integer_line_division(ratio: f64) -> bool {
+    // Rejects zero, negatives and NaN (NaN comparisons are always false).
+    if !(ratio > 0.0) {
+        return false;
+    }
+    let lines_per_output = 1.0 / ratio;
+    let nearest = lines_per_output.round();
+    nearest >= 2.0 && (lines_per_output - nearest).abs() <= NRAW_LINE_DIVISION_TOLERANCE
+}
 
 /// Resolve N-RAW-specific columns (key pattern "<res-class>N<fps-class>", e.g. "4KN60")
 /// for a subsampled capture. Same fps fallback chain as `resolve_columns`, but no
@@ -1064,6 +1112,104 @@ mod tests {
         let tags = HashMap::new();
         let r = db.lookup_readout("NIKON", "Z 8", 1920, 1080, 59.94, 1.0, 35.9, None, &tags).unwrap();
         assert_eq!(r.readout_time_ms, 4.8);
+        assert!(!r.is_estimated);
+    }
+
+    // ZR / Z6III share one nikon.json row; the column set is identical to the Z 8 one.
+    fn zr_row(nraw_col_value: Option<f64>, with_nraw_col: bool) -> Vec<Option<f64>> {
+        let mut row = vec![
+            Some(9.3), Some(9.3), Some(9.3),
+            None, Some(6.1), Some(9.3), Some(9.3), Some(9.3),
+            Some(3.1), Some(3.1), Some(3.1), Some(3.1), Some(3.1),
+        ];
+        if with_nraw_col {
+            row.push(nraw_col_value);
+        }
+        row
+    }
+
+    fn zr_test_db(nraw_col_value: Option<f64>, with_nraw_col: bool) -> CameraDatabase {
+        let mut data = HashMap::new();
+        data.insert("ZR".to_string(), zr_row(nraw_col_value, with_nraw_col));
+        let brand = BrandData {
+            aliases: Vec::new(),
+            crop_type_map: HashMap::new(),
+            models: Vec::new(),
+            crop_rules: Vec::new(),
+            readout: ReadoutData {
+                columns: z8_columns(with_nraw_col),
+                data,
+                additional: HashMap::new(),
+            },
+            readout_adjust: Vec::new(),
+        };
+        let mut brands = HashMap::new();
+        brands.insert("NIKON".to_string(), brand);
+        CameraDatabase { brands }
+    }
+
+    #[test]
+    fn test_is_integer_line_division() {
+        // Z 8 / Z 9 4.1K N-RAW: 2322/4656, 1/ratio = 2.00517 -> 2x2 binning
+        assert!(is_integer_line_division(2322.0 / 4656.0));
+        // ZR / Z6III 4K N-RAW proxy: 2268/3416, 1/ratio = 1.50617 -> oversampled
+        assert!(!is_integer_line_division(2268.0 / 3416.0));
+        // Z6III 4K N-RAW NEV master (container height): 2276/3416, 1/ratio = 1.50087
+        assert!(!is_integer_line_division(2276.0 / 3416.0));
+        // Exact integer divisions
+        assert!(is_integer_line_division(0.5));
+        assert!(is_integer_line_division(1.0 / 3.0));
+        assert!(is_integer_line_division(0.25));
+        // 2/5 is not an integer line division
+        assert!(!is_integer_line_division(0.4));
+        // n must be >= 2: a full read is not a division
+        assert!(!is_integer_line_division(1.0));
+        // Degenerate inputs
+        assert!(!is_integer_line_division(0.0));
+        assert!(!is_integer_line_division(-0.5));
+        assert!(!is_integer_line_division(f64::NAN));
+    }
+
+    #[test]
+    fn test_lookup_readout_binning_still_scales_without_nraw_column() {
+        // Real nikon.json has no 4KN60 column at all; Z 9 / Z 8 must keep the estimate.
+        let db = z8_test_db(None, false);
+        let tags = HashMap::new();
+        let ratio = 2322.0 / 4656.0;
+        let r = db.lookup_readout("NIKON", "Z 8", 4128, 2322, 59.94, 1.0, 35.9, Some(ratio), &tags).unwrap();
+        assert!((r.readout_time_ms - 7.1814).abs() < 0.01, "got {}", r.readout_time_ms);
+        assert!(r.is_estimated);
+    }
+
+    #[test]
+    fn test_lookup_readout_oversampled_falls_back_to_standard_column() {
+        // ZR 4K60 N-RAW proxy: all 3416 crop lines are read, then downscaled to 2268.
+        // The scaling estimate must not run; the standard 4K60 column is the right answer.
+        let db = zr_test_db(None, false);
+        let tags = HashMap::new();
+        let r = db.lookup_readout("NIKON", "ZR", 4032, 2268, 59.94, 1.0, 35.9, Some(2268.0 / 3416.0), &tags).unwrap();
+        assert_eq!(r.readout_time_ms, 9.3);
+        assert!(!r.is_estimated);
+    }
+
+    #[test]
+    fn test_lookup_readout_oversampled_nev_container_height() {
+        // Z6III NEV master lacks usable 0x1015 dims, so the container height is used.
+        let db = zr_test_db(None, false);
+        let tags = HashMap::new();
+        let r = db.lookup_readout("NIKON", "ZR", 4040, 2276, 59.94, 1.0, 35.9, Some(2276.0 / 3416.0), &tags).unwrap();
+        assert_eq!(r.readout_time_ms, 9.3);
+        assert!(!r.is_estimated);
+    }
+
+    #[test]
+    fn test_lookup_readout_calibrated_nraw_column_bypasses_line_division_gate() {
+        // A measured N-RAW column outranks scan-mode inference: even though the ratio is
+        // rejected as a line division, the calibrated value must still win.
+        let db = zr_test_db(Some(8.8), true);
+        let tags = HashMap::new();
+        let r = db.lookup_readout("NIKON", "ZR", 4032, 2268, 59.94, 1.0, 35.9, Some(2268.0 / 3416.0), &tags).unwrap();
+        assert_eq!(r.readout_time_ms, 8.8);
         assert!(!r.is_estimated);
     }
 
