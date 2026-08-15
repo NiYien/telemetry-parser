@@ -285,7 +285,8 @@ impl Sony {
             ))
             .unwrap_or((None, None));
         log::info!(target: "lens",
-            "Sony lens enrichment: source={} res={}x{} sensor={:?}x{:?} upfl={:.6}",
+            "Sony lens enrichment: model={} source={} res={}x{} sensor={:?}x{:?} upfl={:.6}",
+            self.model.as_deref().unwrap_or("?"),
             source,
             video_md.map(|v| v.width).unwrap_or(0),
             video_md.map(|v| v.height).unwrap_or(0),
