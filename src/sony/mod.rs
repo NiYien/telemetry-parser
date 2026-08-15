@@ -203,7 +203,7 @@ impl Sony {
         }
 
         // Determine focal length status from first sample
-        // Case 0: FocalLength > 0 → Gyroflow handles everything, done
+        // Case 0: FocalLength > 0 → enrich missing pixel focal metadata
         // Case 1: FocalLength tag exists but = 0 → compute unit_px_fl from RTMD sensor geometry
         // Case 2: No FocalLength tag → full JSON fallback
         let focal_length_status = samples.first()
@@ -216,8 +216,7 @@ impl Sony {
 
         match focal_length_status {
             Some(fl) if fl > 0.0 => {
-                // Case 0: RTMD complete, Gyroflow calculates everything
-                return;
+                self.process_case0_positive_focal(samples, options, video_md);
             }
             Some(_) => {
                 // Case 1: FocalLength = 0, compute unit_px_fl from RTMD sensor geometry
@@ -228,6 +227,72 @@ impl Sony {
                 self.process_case2_json_fallback(samples, options, video_md);
             }
         }
+    }
+
+    /// Case 0: RTMD has a positive physical focal length.
+    /// Derive missing pixel focal metadata from effective video geometry first.
+    fn process_case0_positive_focal(&mut self, samples: &mut Vec<SampleInfo>, options: &crate::InputOptions, video_md: Option<&VideoMetadata>) {
+        let video_geometry = self.video_unit_pixel_focal_length(samples, video_md);
+        if let Some(upfl) = video_geometry {
+            self.emit_lens_geometry(samples, options, upfl, "video_geometry", video_md);
+            return;
+        }
+
+        // Reuse the existing Sony database path only when the video has no valid geometry.
+        self.process_case2_json_fallback(samples, options, video_md);
+        let database_scale = samples.first()
+            .and_then(|s| s.tag_map.as_ref())
+            .and_then(|map| map.get(&GroupId::Lens))
+            .and_then(|lens| lens.get_t(TagId::Custom("unit_pixel_focal_length".into())) as Option<&f64>)
+            .copied();
+        if let Some(upfl) = database_scale {
+            self.emit_lens_geometry(samples, options, upfl, "camera_db", video_md);
+        }
+    }
+
+    fn video_unit_pixel_focal_length(&self, samples: &[SampleInfo], video_md: Option<&VideoMetadata>) -> Option<f64> {
+        let (sensor_width, sensor_height): (Option<f32>, Option<f32>) = samples.first()
+            .and_then(|s| s.tag_map.as_ref())
+            .and_then(|map| map.get(&GroupId::Default))
+            .map(|default| (
+                default.get_t(TagId::SensorWidth).copied(),
+                default.get_t(TagId::SensorHeight).copied(),
+            ))
+            .unwrap_or((None, None));
+        resolve_video_unit_pixel_focal_length(
+            video_md.map(|v| v.width).unwrap_or(0),
+            video_md.map(|v| v.height).unwrap_or(0),
+            sensor_width.map(|v| v as f64),
+            sensor_height.map(|v| v as f64),
+            None,
+        )
+    }
+
+    fn emit_lens_geometry(&self, samples: &mut [SampleInfo], options: &crate::InputOptions, unit_pixel_focal_length: f64, source: &str, video_md: Option<&VideoMetadata>) {
+        for sample in samples.iter_mut() {
+            if let Some(ref mut map) = sample.tag_map {
+                util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit_pixel_focal_length, Vec::new()), options);
+            }
+        }
+        emit_pixel_focal_lengths(samples, unit_pixel_focal_length, options);
+
+        let (sensor_width, sensor_height): (Option<f32>, Option<f32>) = samples.first()
+            .and_then(|s| s.tag_map.as_ref())
+            .and_then(|map| map.get(&GroupId::Default))
+            .map(|default| (
+                default.get_t(TagId::SensorWidth).copied(),
+                default.get_t(TagId::SensorHeight).copied(),
+            ))
+            .unwrap_or((None, None));
+        log::info!(target: "lens",
+            "Sony lens enrichment: source={} res={}x{} sensor={:?}x{:?} upfl={:.6}",
+            source,
+            video_md.map(|v| v.width).unwrap_or(0),
+            video_md.map(|v| v.height).unwrap_or(0),
+            sensor_width,
+            sensor_height,
+            unit_pixel_focal_length,
+        );
     }
 
     /// Case 1: RTMD exists but FocalLength = 0.
@@ -472,5 +537,99 @@ impl Sony {
             util::insert_tag(map, tag_info, options);
         }
         Ok(())
+    }
+}
+
+fn valid_positive(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| v.is_finite() && *v > 0.0)
+}
+
+fn resolve_video_unit_pixel_focal_length(
+    video_width: usize,
+    video_height: usize,
+    sensor_width: Option<f64>,
+    sensor_height: Option<f64>,
+    database_fallback: Option<f64>,
+) -> Option<f64> {
+    let horizontal = valid_positive(sensor_width)
+        .and_then(|sensor| valid_positive(Some(video_width as f64 / sensor)));
+    horizontal
+        .or_else(|| valid_positive(sensor_height).and_then(|sensor| valid_positive(Some(video_height as f64 / sensor))))
+        .or_else(|| valid_positive(database_fallback))
+}
+
+fn emit_pixel_focal_lengths(samples: &mut [SampleInfo], unit_pixel_focal_length: f64, options: &crate::InputOptions) {
+    for sample in samples.iter_mut() {
+        let Some(map) = sample.tag_map.as_mut() else { continue; };
+        let (focal_length, has_pixel_focal_length) = {
+            let lens = map.get(&GroupId::Lens);
+            let focal_length = lens
+                .and_then(|m| m.get_t(TagId::FocalLength) as Option<&f32>)
+                .map(|v| *v as f64)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .or(options.user_focal_length.filter(|v| v.is_finite() && *v > 0.0));
+            let has_pixel_focal_length = lens
+                .and_then(|m| m.get_t(TagId::PixelFocalLength) as Option<&f32>)
+                .map(|v| (*v as f64).is_finite() && *v > 0.0)
+                .unwrap_or(false);
+            (focal_length, has_pixel_focal_length)
+        };
+        if !has_pixel_focal_length {
+            if let Some(focal_length) = focal_length {
+                let pixel_focal_length = focal_length * unit_pixel_focal_length;
+                if pixel_focal_length.is_finite() && pixel_focal_length > 0.0 {
+                    util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{:.2}", v), pixel_focal_length as f32, Vec::new()), options);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{emit_pixel_focal_lengths, resolve_video_unit_pixel_focal_length};
+    use crate::{tag, tags_impl::*, InputOptions, SampleInfo};
+
+    #[test]
+    fn derives_unit_pixel_focal_length_from_video_sensor_geometry() {
+        let scale = resolve_video_unit_pixel_focal_length(
+            3840,
+            2160,
+            Some(32.26),
+            Some(18.14),
+            None,
+        );
+
+        assert!((scale.unwrap() - (3840.0 / 32.26)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prefers_vertical_geometry_when_horizontal_is_invalid() {
+        let scale = resolve_video_unit_pixel_focal_length(3840, 2160, Some(0.0), Some(18.14), None);
+        assert!((scale.unwrap() - (2160.0 / 18.14)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn uses_database_scale_only_when_video_geometry_is_invalid() {
+        let scale = resolve_video_unit_pixel_focal_length(3840, 2160, Some(f64::NAN), Some(-1.0), Some(123.0));
+        assert_eq!(scale, Some(123.0));
+    }
+
+    #[test]
+    fn emits_per_frame_pixel_focal_lengths_and_preserves_existing_values() {
+        let mut first = GroupedTagMap::new();
+        let mut second = GroupedTagMap::new();
+        crate::util::insert_tag(&mut first, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{v}"), 30.0, Vec::new()), &InputOptions::default());
+        crate::util::insert_tag(&mut second, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{v}"), 40.0, Vec::new()), &InputOptions::default());
+        crate::util::insert_tag(&mut second, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{v}"), 999.0, Vec::new()), &InputOptions::default());
+        let mut samples = vec![
+            SampleInfo { tag_map: Some(first), ..SampleInfo::default() },
+            SampleInfo { tag_map: Some(second), ..SampleInfo::default() },
+        ];
+        emit_pixel_focal_lengths(&mut samples, 100.0, &InputOptions::default());
+        let first_pfl: Option<f32> = samples[0].tag_map.as_ref().unwrap().get(&GroupId::Lens).unwrap().get_t(TagId::PixelFocalLength).copied();
+        let second_pfl: Option<f32> = samples[1].tag_map.as_ref().unwrap().get(&GroupId::Lens).unwrap().get_t(TagId::PixelFocalLength).copied();
+        assert_eq!(first_pfl, Some(3000.0f32));
+        assert_eq!(second_pfl, Some(999.0f32));
     }
 }
