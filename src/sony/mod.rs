@@ -588,7 +588,7 @@ fn emit_pixel_focal_lengths(samples: &mut [SampleInfo], unit_pixel_focal_length:
 #[cfg(test)]
 mod tests {
     use super::{emit_pixel_focal_lengths, resolve_video_unit_pixel_focal_length};
-    use crate::{tag, tags_impl::*, InputOptions, SampleInfo};
+    use crate::{tag, tags_impl::*, util::VideoMetadata, InputOptions, SampleInfo};
 
     #[test]
     fn derives_unit_pixel_focal_length_from_video_sensor_geometry() {
@@ -631,5 +631,41 @@ mod tests {
         let second_pfl: Option<f32> = samples[1].tag_map.as_ref().unwrap().get(&GroupId::Lens).unwrap().get_t(TagId::PixelFocalLength).copied();
         assert_eq!(first_pfl, Some(3000.0f32));
         assert_eq!(second_pfl, Some(999.0f32));
+    }
+
+    #[test]
+    fn positive_focal_enrichment_uses_video_geometry_before_database() {
+        let mut default = TagMap::new();
+        let mut lens = TagMap::new();
+        default.insert(
+            TagId::SensorWidth,
+            tag!(parsed GroupId::Default, TagId::SensorWidth, "Sensor width", f32, |v| format!("{v}"), 32.26, Vec::new()),
+        );
+        default.insert(
+            TagId::SensorHeight,
+            tag!(parsed GroupId::Default, TagId::SensorHeight, "Sensor height", f32, |v| format!("{v}"), 18.14, Vec::new()),
+        );
+        lens.insert(
+            TagId::FocalLength,
+            tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{v}"), 30.0, Vec::new()),
+        );
+        let mut map = GroupedTagMap::new();
+        map.insert(GroupId::Default, default);
+        map.insert(GroupId::Lens, lens);
+        let mut samples = vec![SampleInfo { tag_map: Some(map), ..SampleInfo::default() }];
+        let mut sony = super::Sony::default();
+        sony.process_map(
+            &mut samples,
+            &InputOptions::default(),
+            Some(&VideoMetadata { width: 3840, height: 2160, ..VideoMetadata::default() }),
+            None,
+            None,
+        );
+
+        let lens = samples[0].tag_map.as_ref().unwrap().get(&GroupId::Lens).unwrap();
+        let upfl: Option<f64> = lens.get_t(TagId::Custom("unit_pixel_focal_length".into())).copied();
+        let pfl: Option<f32> = lens.get_t(TagId::PixelFocalLength).copied();
+        assert!((upfl.unwrap() - 3840.0 / 32.26).abs() < 1e-4);
+        assert!((pfl.unwrap() as f64 - 3840.0 / 32.26 * 30.0).abs() < 0.01);
     }
 }
