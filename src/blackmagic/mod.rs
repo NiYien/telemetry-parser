@@ -587,6 +587,10 @@ impl BlackmagicBraw {
         // and skip the camera_db upfl derivation entirely for CinemaDNG.
         let mut tiff_width = 0u32;
         let mut tiff_height = 0u32;
+        // DNG FrameRate (0xC764). CinemaDNG really does carry the frame rate, so
+        // a single frame is enough to resolve the fps-segmented camera_db columns
+        // and to let the host skip its "what frame rate is this sequence?" prompt.
+        let mut tiff_frame_rate: Option<f64> = None;
         let is_tiff = tiff_ifd::is_tiff_header(&all);
         if model_name.is_none() && is_tiff {
             // First scalar of a SHORT (3) or LONG (4) entry
@@ -596,6 +600,17 @@ impl BlackmagicBraw {
                     4 => tiff_ifd::read_u32(value_data, 0, is_le).unwrap_or(0),
                     _ => 0,
                 }
+            }
+            // SRATIONAL (typ 10) num/den pair. Byte order comes from the TIFF
+            // header, so BMD's big-endian CinemaDNG and little-endian writers
+            // both land here. A zero or negative denominator is a broken entry
+            // and is dropped rather than turned into an infinity/negative fps.
+            fn tiff_srational(typ: u16, value_data: &[u8], is_le: bool) -> Option<f64> {
+                if typ != 10 || value_data.len() < 8 { return None; }
+                let num = tiff_ifd::read_u32(value_data, 0, is_le)? as i32;
+                let den = tiff_ifd::read_u32(value_data, 4, is_le)? as i32;
+                if den <= 0 || num <= 0 { return None; }
+                Some(num as f64 / den as f64)
             }
             let is_le = tiff_ifd::detect_byte_order(&all).unwrap_or(true);
             if let Some(ifd0_offset) = tiff_ifd::read_u32(&all, 4, is_le) {
@@ -614,6 +629,7 @@ impl BlackmagicBraw {
                             }
                             0x0100 => { tiff_width  = tiff_uint(typ, value_data, is_le); } // ImageWidth
                             0x0101 => { tiff_height = tiff_uint(typ, value_data, is_le); } // ImageLength
+                            0xC764 => { tiff_frame_rate = tiff_srational(typ, value_data, is_le); } // FrameRate
                             _ => {}
                         }
                     });
@@ -688,13 +704,20 @@ impl BlackmagicBraw {
             if v > 0 {
                 util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:?}", v), v as f64, vec![]), &options);
             }
+        } else if let Some(v) = tiff_frame_rate {
+            // DNG 0xC764. Reported as a real FrameRate tag because the container
+            // carries it -- unlike options.video_fps below, which comes from the
+            // caller and must never be echoed back as file metadata.
+            util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:?}", v), v, vec![]), &options);
         }
-        // Table-lookup fps: single-frame TIFF/DNG carries no frame rate, so the
-        // caller-supplied value is the only way the fps-segmented camera_db
-        // tables (crop / readout) can resolve a column. Lookup only -- the
-        // FrameRate tag above stays container-sourced.
+        // Table-lookup fps for the fps-segmented camera_db tables (crop /
+        // readout). Container first, then the DNG's own FrameRate tag, and only
+        // then the caller-supplied value -- that last one stays lookup-only and
+        // is never reported as a FrameRate tag.
         let fps = if container_fps > 0.0 {
             container_fps
+        } else if let Some(v) = tiff_frame_rate {
+            v
         } else {
             options.video_fps.filter(|v| *v > 0.0).unwrap_or(0.0)
         };
@@ -1066,32 +1089,68 @@ mod tests {
 
     // ---- CinemaDNG: TIFF resolution fallback + camera_db upfl (feedback 20260807-441084d0) ----
 
-    fn push_ifd_entry(d: &mut Vec<u8>, tag: u16, typ: u16, cnt: u32, val: u32) {
-        d.extend_from_slice(&tag.to_le_bytes());
-        d.extend_from_slice(&typ.to_le_bytes());
-        d.extend_from_slice(&cnt.to_le_bytes());
-        d.extend_from_slice(&val.to_le_bytes());
+    fn u16_bo(v: u16, is_le: bool) -> [u8; 2] { if is_le { v.to_le_bytes() } else { v.to_be_bytes() } }
+    fn u32_bo(v: u32, is_le: bool) -> [u8; 4] { if is_le { v.to_le_bytes() } else { v.to_be_bytes() } }
+
+    fn push_ifd_entry(d: &mut Vec<u8>, tag: u16, typ: u16, cnt: u32, val: u32, is_le: bool) {
+        d.extend_from_slice(&u16_bo(tag, is_le));
+        d.extend_from_slice(&u16_bo(typ, is_le));
+        d.extend_from_slice(&u32_bo(cnt, is_le));
+        // TIFF left-justifies an inline value, so a single SHORT occupies the
+        // first two bytes of the 4-byte value field. That only coincides with a
+        // full-width write in little-endian.
+        if typ == 3 && cnt == 1 {
+            d.extend_from_slice(&u16_bo(val as u16, is_le));
+            d.extend_from_slice(&[0, 0]);
+        } else {
+            d.extend_from_slice(&u32_bo(val, is_le));
+        }
     }
 
     fn synthetic_dng(model: &str, width: u32, height: u32) -> Vec<u8> {
-        // Minimal little-endian TIFF: IFD0 with ImageWidth (LONG), ImageLength
-        // (SHORT, to exercise both scalar types) and UniqueCameraModel (ASCII,
-        // indirect). header(8) + count(2) + 3*12 + next(4) = 50.
+        synthetic_dng_ex(model, width, height, true, None)
+    }
+
+    // Minimal TIFF: IFD0 with ImageWidth (LONG), ImageLength (SHORT, to exercise
+    // both scalar types), UniqueCameraModel (ASCII, indirect) and optionally
+    // FrameRate (0xC764, SRATIONAL, indirect - 8 bytes never fit inline, exactly
+    // as real CinemaDNG writes it). Entries stay sorted by tag.
+    fn synthetic_dng_ex(model: &str, width: u32, height: u32, is_le: bool, frame_rate: Option<(i32, i32)>) -> Vec<u8> {
         let mut model_z = model.as_bytes().to_vec();
         model_z.push(0);
-        let str_offset = 50u32;
+        let entries: u16 = if frame_rate.is_some() { 4 } else { 3 };
+        // header(8) + count(2) + entries*12 + next(4)
+        let ifd_end = 8 + 2 + entries as u32 * 12 + 4;
+        let rational_offset = ifd_end;
+        let str_offset = ifd_end + if frame_rate.is_some() { 8 } else { 0 };
         let mut d = Vec::new();
-        d.extend_from_slice(b"II");
-        d.extend_from_slice(&42u16.to_le_bytes());
-        d.extend_from_slice(&8u32.to_le_bytes());
-        d.extend_from_slice(&3u16.to_le_bytes());
-        push_ifd_entry(&mut d, 0x0100, 4, 1, width);                         // ImageWidth
-        push_ifd_entry(&mut d, 0x0101, 3, 1, height);                        // ImageLength
-        push_ifd_entry(&mut d, 0xC614, 2, model_z.len() as u32, str_offset); // UniqueCameraModel
-        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(if is_le { b"II" } else { b"MM" });
+        d.extend_from_slice(&u16_bo(42, is_le));
+        d.extend_from_slice(&u32_bo(8, is_le));
+        d.extend_from_slice(&u16_bo(entries, is_le));
+        push_ifd_entry(&mut d, 0x0100, 4, 1, width, is_le);                         // ImageWidth
+        push_ifd_entry(&mut d, 0x0101, 3, 1, height, is_le);                        // ImageLength
+        push_ifd_entry(&mut d, 0xC614, 2, model_z.len() as u32, str_offset, is_le); // UniqueCameraModel
+        if frame_rate.is_some() {
+            push_ifd_entry(&mut d, 0xC764, 10, 1, rational_offset, is_le);          // FrameRate
+        }
+        d.extend_from_slice(&u32_bo(0, is_le));
+        assert_eq!(d.len(), ifd_end as usize);
+        if let Some((num, den)) = frame_rate {
+            d.extend_from_slice(&u32_bo(num as u32, is_le));
+            d.extend_from_slice(&u32_bo(den as u32, is_le));
+        }
         assert_eq!(d.len(), str_offset as usize);
         d.extend_from_slice(&model_z);
         d
+    }
+
+    fn frame_rate_of(samples: &[SampleInfo]) -> Option<f64> {
+        samples.first()
+            .and_then(|s| s.tag_map.as_ref())
+            .and_then(|m| m.get(&GroupId::Default))
+            .and_then(|m| m.get_t(TagId::FrameRate) as Option<&f64>)
+            .copied()
     }
 
     fn parse_synthetic_dng(bytes: &[u8], db_json: &str, db_dir_name: &str, video_fps: Option<f64>) -> (BlackmagicBraw, Vec<SampleInfo>) {
@@ -1178,6 +1237,81 @@ mod tests {
         // upfl is fps-independent and must still be there.
         let upfl = upfl_of(&samples);
         assert!((upfl - 2432.0 / 15.81f32 as f64).abs() < 1e-6);
+    }
+
+    // Distinguishable per-column values, so a passing assertion proves which
+    // fps column was resolved rather than which table row.
+    const BMCC_DB_DISTINCT_COLUMNS: &str = r#"{
+        "version": 1, "aliases": {},
+        "models": { "BMCC": { "sw": 15.81 } },
+        "readout": {
+            "columns": ["1K30", "1K24"],
+            "data": { "BMCC": [-30, -24] }
+        }
+    }"#;
+
+    #[test]
+    fn cinemadng_frame_rate_is_read_from_big_endian_srational() {
+        // Real BMCC 2.5K CinemaDNG: big-endian TIFF, 0xC764 = 24/1. Verified on
+        // BMCC_2026-08-16_1903_C0002_000000.dng, whose IFD0 entry reads
+        // c764 000a 00000001 00002346 with 0000001800000001 at that offset.
+        let bytes = synthetic_dng_ex("Blackmagic Cinema Camera", 2432, 1366, false, Some((24, 1)));
+        let (bmd, samples) = parse_synthetic_dng(&bytes, BMCC_DB_DISTINCT_COLUMNS,
+            "tp-test-camera-db-bmcc25k-fps-be", None);
+
+        assert_eq!(bmd.model.as_deref(), Some("BMCC"));
+        let fps = frame_rate_of(&samples).expect("0xC764 must be reported as a FrameRate tag");
+        assert!((fps - 24.0).abs() < 1e-9, "fps = {fps}");
+        // ...and the file's own frame rate resolves the readout column without
+        // the caller passing an fps in at all.
+        assert_eq!(bmd.frame_readout_time, Some(24.0));
+    }
+
+    #[test]
+    fn cinemadng_frame_rate_is_read_from_little_endian_srational() {
+        // SIGMA fp writes 30000/1001 little-endian; same shape, opposite order.
+        let bytes = synthetic_dng_ex("Blackmagic Cinema Camera", 2432, 1366, true, Some((30000, 1001)));
+        let (bmd, samples) = parse_synthetic_dng(&bytes, BMCC_DB_DISTINCT_COLUMNS,
+            "tp-test-camera-db-bmcc25k-fps-le", None);
+
+        let fps = frame_rate_of(&samples).expect("0xC764 must be reported as a FrameRate tag");
+        assert!((fps - 30000.0 / 1001.0).abs() < 1e-9, "fps = {fps}");
+        // 29.97 lands in the "30" column, not the "24" one.
+        assert_eq!(bmd.frame_readout_time, Some(30.0));
+    }
+
+    #[test]
+    fn cinemadng_frame_rate_absent_without_the_tag() {
+        let bytes = synthetic_dng("Blackmagic Cinema Camera", 2432, 1366);
+        let (_, samples) = parse_synthetic_dng(&bytes, BMCC_DB_DISTINCT_COLUMNS,
+            "tp-test-camera-db-bmcc25k-fps-none", None);
+
+        assert_eq!(frame_rate_of(&samples), None);
+    }
+
+    #[test]
+    fn cinemadng_frame_rate_rejects_a_zero_denominator() {
+        // A broken entry must leave frame_rate unset rather than produce an
+        // infinity that would then pick an arbitrary readout column.
+        let bytes = synthetic_dng_ex("Blackmagic Cinema Camera", 2432, 1366, false, Some((24, 0)));
+        let (bmd, samples) = parse_synthetic_dng(&bytes, BMCC_DB_DISTINCT_COLUMNS,
+            "tp-test-camera-db-bmcc25k-fps-zero", None);
+
+        assert_eq!(frame_rate_of(&samples), None);
+        assert_eq!(bmd.frame_readout_time, None);
+    }
+
+    #[test]
+    fn cinemadng_frame_rate_tag_beats_the_caller_supplied_fps() {
+        // The file's own value wins over the host's guess - which is the whole
+        // point: a user who typed 29.94 into the fps prompt gets the real 24.
+        let bytes = synthetic_dng_ex("Blackmagic Cinema Camera", 2432, 1366, false, Some((24, 1)));
+        let (bmd, samples) = parse_synthetic_dng(&bytes, BMCC_DB_DISTINCT_COLUMNS,
+            "tp-test-camera-db-bmcc25k-fps-beats-caller", Some(30.0));
+
+        let fps = frame_rate_of(&samples).expect("FrameRate tag must come from the file");
+        assert!((fps - 24.0).abs() < 1e-9, "fps = {fps}");
+        assert_eq!(bmd.frame_readout_time, Some(24.0));
     }
 
     #[test]
