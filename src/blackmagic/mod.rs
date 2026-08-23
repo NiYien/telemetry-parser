@@ -591,6 +591,12 @@ impl BlackmagicBraw {
         // a single frame is enough to resolve the fps-segmented camera_db columns
         // and to let the host skip its "what frame rate is this sequence?" prompt.
         let mut tiff_frame_rate: Option<f64> = None;
+        // DNG TimeCodes (0xC763). The only time BMD CinemaDNG carries at all -
+        // it writes no DateTime/DateTimeOriginal - and it is a SMPTE 12M
+        // timecode, so it has hours/minutes/seconds/frames but NO DATE. Report
+        // it as what it is and let the host decide whether it can pair the
+        // time-of-day with a date from somewhere else.
+        let mut tiff_timecode: Option<String> = None;
         let is_tiff = tiff_ifd::is_tiff_header(&all);
         if model_name.is_none() && is_tiff {
             // First scalar of a SHORT (3) or LONG (4) entry
@@ -612,6 +618,29 @@ impl BlackmagicBraw {
                 if den <= 0 || num <= 0 { return None; }
                 Some(num as f64 / den as f64)
             }
+            // SMPTE 12M packed BCD, 8 bytes per timecode: frames, seconds,
+            // minutes, hours (the high bits of each carry flags - drop-frame,
+            // colour-frame, binary-group - and are masked off). A byte array, so
+            // the TIFF byte order does not apply. Only the first timecode of the
+            // group is read; out-of-range fields mean a group that is not a
+            // wall-clock timecode and are rejected rather than clamped.
+            fn tiff_timecode_str(value_data: &[u8]) -> Option<String> {
+                if value_data.len() < 4 { return None; }
+                // Units nibble > 9 is not valid BCD, so the group is not a
+                // timecode; the tens nibble is masked because its top bit(s)
+                // carry SMPTE flags (drop-frame, colour-frame, binary-group).
+                let bcd = |b: u8, tens_mask: u8| -> Option<u32> {
+                    let units = (b & 0x0F) as u32;
+                    if units > 9 { return None; }
+                    Some(units + ((b >> 4) & tens_mask) as u32 * 10)
+                };
+                let frames = bcd(value_data[0], 0x03)?;
+                let seconds = bcd(value_data[1], 0x07)?;
+                let minutes = bcd(value_data[2], 0x07)?;
+                let hours = bcd(value_data[3], 0x03)?;
+                if hours > 23 || minutes > 59 || seconds > 59 { return None; }
+                Some(format!("{hours:02}:{minutes:02}:{seconds:02}:{frames:02}"))
+            }
             let is_le = tiff_ifd::detect_byte_order(&all).unwrap_or(true);
             if let Some(ifd0_offset) = tiff_ifd::read_u32(&all, 4, is_le) {
                 let mut unique_model = None;
@@ -629,6 +658,7 @@ impl BlackmagicBraw {
                             }
                             0x0100 => { tiff_width  = tiff_uint(typ, value_data, is_le); } // ImageWidth
                             0x0101 => { tiff_height = tiff_uint(typ, value_data, is_le); } // ImageLength
+                            0xC763 => { tiff_timecode = tiff_timecode_str(value_data); } // TimeCodes
                             0xC764 => { tiff_frame_rate = tiff_srational(typ, value_data, is_le); } // FrameRate
                             _ => {}
                         }
@@ -709,6 +739,13 @@ impl BlackmagicBraw {
             // carries it -- unlike options.video_fps below, which comes from the
             // caller and must never be echoed back as file metadata.
             util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:?}", v), v, vec![]), &options);
+        }
+        // DNG 0xC763, deliberately NOT a CreationDate tag: a SMPTE timecode is a
+        // time of day with no date, so calling it a creation date would report
+        // something the container does not contain. Hosts that can source a date
+        // elsewhere (a filename convention, say) can combine the two themselves.
+        if let Some(ref tc) = tiff_timecode {
+            util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::Custom("timecode".into()), "Timecode", String, |v| v.clone(), tc.clone(), vec![]), &options);
         }
         // Table-lookup fps for the fps-segmented camera_db tables (crop /
         // readout). Container first, then the DNG's own FrameRate tag, and only
@@ -1145,6 +1182,32 @@ mod tests {
         d
     }
 
+    // IFD0 with ImageWidth / ImageLength / UniqueCameraModel / TimeCodes. The
+    // timecode's 8 bytes never fit inline, so they live out of line exactly as
+    // real CinemaDNG writes them.
+    fn synthetic_dng_tc(model: &str, is_le: bool, tc: [u8; 8]) -> Vec<u8> {
+        let mut model_z = model.as_bytes().to_vec();
+        model_z.push(0);
+        let ifd_end = 8 + 2 + 4 * 12 + 4;
+        let tc_offset = ifd_end;
+        let str_offset = ifd_end + 8;
+        let mut d = Vec::new();
+        d.extend_from_slice(if is_le { b"II" } else { b"MM" });
+        d.extend_from_slice(&u16_bo(42, is_le));
+        d.extend_from_slice(&u32_bo(8, is_le));
+        d.extend_from_slice(&u16_bo(4, is_le));
+        push_ifd_entry(&mut d, 0x0100, 4, 1, 2432, is_le);
+        push_ifd_entry(&mut d, 0x0101, 3, 1, 1366, is_le);
+        push_ifd_entry(&mut d, 0xC614, 2, model_z.len() as u32, str_offset, is_le);
+        push_ifd_entry(&mut d, 0xC763, 1, 8, tc_offset, is_le); // TimeCodes (BYTE[8])
+        d.extend_from_slice(&u32_bo(0, is_le));
+        assert_eq!(d.len(), ifd_end as usize);
+        d.extend_from_slice(&tc);
+        assert_eq!(d.len(), str_offset as usize);
+        d.extend_from_slice(&model_z);
+        d
+    }
+
     fn frame_rate_of(samples: &[SampleInfo]) -> Option<f64> {
         samples.first()
             .and_then(|s| s.tag_map.as_ref())
@@ -1249,6 +1312,63 @@ mod tests {
             "data": { "BMCC": [-30, -24] }
         }
     }"#;
+
+    fn timecode_of(samples: &[SampleInfo]) -> Option<String> {
+        samples.first()
+            .and_then(|s| s.tag_map.as_ref())
+            .and_then(|m| m.get(&GroupId::Default))
+            .and_then(|m| m.get_t(TagId::Custom("timecode".into())) as Option<&String>)
+            .cloned()
+    }
+
+    #[test]
+    fn cinemadng_timecode_is_decoded_from_packed_bcd() {
+        // Real BMCC bytes: 00 44 03 19 00 00 00 00 -> 19:03:44:00, matching the
+        // clip's own name (BMCC_2026-08-16_1903_C0002). Packed BCD, and a byte
+        // array, so the TIFF byte order does not apply - the same bytes must
+        // decode identically in a little-endian file.
+        for is_le in [false, true] {
+            let bytes = synthetic_dng_tc("Blackmagic Cinema Camera", is_le, [0x00, 0x44, 0x03, 0x19, 0, 0, 0, 0]);
+            let (_, samples) = parse_synthetic_dng(&bytes, BMCC_DB_DISTINCT_COLUMNS,
+                &format!("tp-test-camera-db-bmcc25k-tc-{is_le}"), None);
+            assert_eq!(timecode_of(&samples).as_deref(), Some("19:03:44:00"), "is_le={is_le}");
+        }
+    }
+
+    #[test]
+    fn cinemadng_timecode_keeps_smpte_flag_bits_out_of_the_value() {
+        // 0x99 in the seconds slot is legitimate: bit 7 is a SMPTE flag, so the
+        // tens nibble masks to 1 and the value is 19 seconds, not 99.
+        let bytes = synthetic_dng_tc("Blackmagic Cinema Camera", false, [0x00, 0x99, 0x03, 0x19, 0, 0, 0, 0]);
+        let (_, samples) = parse_synthetic_dng(&bytes, BMCC_DB_DISTINCT_COLUMNS,
+            "tp-test-camera-db-bmcc25k-tc-flags", None);
+        assert_eq!(timecode_of(&samples).as_deref(), Some("19:03:19:00"));
+    }
+
+    #[test]
+    fn cinemadng_timecode_rejects_a_group_that_is_not_a_timecode() {
+        // A units nibble above 9 is not valid BCD, so these bytes are not a
+        // timecode at all. Rejecting beats clamping: a bogus time of day
+        // silently poisons any host that pairs it with a date.
+        let bytes = synthetic_dng_tc("Blackmagic Cinema Camera", false, [0x00, 0x0F, 0x03, 0x19, 0, 0, 0, 0]);
+        let (_, samples) = parse_synthetic_dng(&bytes, BMCC_DB_DISTINCT_COLUMNS,
+            "tp-test-camera-db-bmcc25k-tc-bad", None);
+        assert_eq!(timecode_of(&samples), None);
+
+        // ...and an hours field that decodes past 23 is rejected too.
+        let bytes = synthetic_dng_tc("Blackmagic Cinema Camera", false, [0x00, 0x44, 0x03, 0x39, 0, 0, 0, 0]);
+        let (_, samples) = parse_synthetic_dng(&bytes, BMCC_DB_DISTINCT_COLUMNS,
+            "tp-test-camera-db-bmcc25k-tc-hours", None);
+        assert_eq!(timecode_of(&samples), None);
+    }
+
+    #[test]
+    fn cinemadng_timecode_absent_without_the_tag() {
+        let bytes = synthetic_dng("Blackmagic Cinema Camera", 2432, 1366);
+        let (_, samples) = parse_synthetic_dng(&bytes, BMCC_DB_DISTINCT_COLUMNS,
+            "tp-test-camera-db-bmcc25k-tc-none", None);
+        assert_eq!(timecode_of(&samples), None);
+    }
 
     #[test]
     fn cinemadng_frame_rate_is_read_from_big_endian_srational() {
