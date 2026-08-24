@@ -53,8 +53,46 @@ impl Sigma {
         v
     }
 
+    /// `SIGM` must be a real ISOBMFF box, not four stray bytes of bitstream.
+    ///
+    /// `detect` only sees the raw head+tail buffer, which on a high-bitrate clip
+    /// is almost entirely compressed video payload, and a bare 4-byte substring
+    /// search matches that payload in roughly 0.5% of files (measured: 11 hits
+    /// over 91 real non-Sigma clips x 24 probe tokens). Because a successful
+    /// `detect` claims the file outright, one such collision took a Panasonic S9
+    /// clip away from the Panasonic parser and left it with no lens metadata at
+    /// all, which then blocked a whole 149-job batch on the lens-data gate.
+    ///
+    /// Anchoring on the preceding big-endian box size rejected every one of those
+    /// collisions while still matching real Sigma boxes, whose sizes are 11152
+    /// (fp), 11196 (fp L) and 158520 (BF) bytes.
+    fn has_sigm_box(buffer: &[u8]) -> bool {
+        let mut from = 0;
+        while let Some(rel) = memmem::find(&buffer[from..], b"SIGM") {
+            let pos = from + rel;
+            if pos >= 4 {
+                let size = u32::from_be_bytes([
+                    buffer[pos - 4], buffer[pos - 3], buffer[pos - 2], buffer[pos - 1],
+                ]) as usize;
+                if size >= 8 && size <= buffer.len() {
+                    return true;
+                }
+            }
+            from = pos + 1;
+        }
+        false
+    }
+
     pub fn detect<P: AsRef<std::path::Path>>(buffer: &[u8], _filepath: P, _options: &crate::InputOptions) -> Option<Self> {
-        if memmem::find(buffer, b"SIGM").is_some() || memmem::find(buffer, b"SIGMA").is_some() {
+        // DNG is TIFF, not ISOBMFF: there is no box structure to anchor against,
+        // and `parse` routes it to parse_dng which never looks for a SIGM atom.
+        // That path therefore keeps the original predicate unchanged.
+        let claimed = if is_tiff_header(buffer) {
+            memmem::find(buffer, b"SIGM").is_some() || memmem::find(buffer, b"SIGMA").is_some()
+        } else {
+            Self::has_sigm_box(buffer)
+        };
+        if claimed {
             return Some(Self {
                 model: None,
                 lens: None,
@@ -510,3 +548,52 @@ fn parse_tiff_ifd(tiff_data: &[u8]) -> Result<SigmaExifData> {
     Ok(result)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claims(buffer: &[u8]) -> bool {
+        Sigma::detect(buffer, "probe.mov", &crate::InputOptions::default()).is_some()
+    }
+
+    /// The regression that motivated the box anchor: `detect` sees mostly raw
+    /// compressed payload, and four stray bytes there used to hand a Panasonic
+    /// clip to this parser, which then failed and left the clip with no metadata.
+    #[test]
+    fn bare_sigm_in_bitstream_is_not_claimed() {
+        let mut buffer = vec![0xAAu8; 4096];
+        buffer[2048..2052].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        buffer[2052..2056].copy_from_slice(b"SIGM");
+        assert!(!claims(&buffer));
+    }
+
+    #[test]
+    fn sigm_preceded_by_a_plausible_box_size_is_claimed() {
+        let mut buffer = vec![0xAAu8; 4096];
+        buffer[2048..2052].copy_from_slice(&2048u32.to_be_bytes());
+        buffer[2052..2056].copy_from_slice(b"SIGM");
+        assert!(claims(&buffer));
+    }
+
+    /// An early collision must not stop the scan: real files can carry both.
+    #[test]
+    fn a_real_box_after_a_collision_still_claims() {
+        let mut buffer = vec![0xAAu8; 8192];
+        buffer[1000..1004].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        buffer[1004..1008].copy_from_slice(b"SIGM");
+        buffer[5000..5004].copy_from_slice(&4096u32.to_be_bytes());
+        buffer[5004..5008].copy_from_slice(b"SIGM");
+        assert!(claims(&buffer));
+    }
+
+    /// DNG is TIFF and `parse` routes it to parse_dng, which never looks for a
+    /// SIGM atom, so that path must keep the plain substring predicate.
+    #[test]
+    fn dng_keeps_the_plain_substring_predicate() {
+        let mut buffer = vec![0u8; 4096];
+        buffer[..4].copy_from_slice(b"II\x2a\x00");
+        buffer[100..105].copy_from_slice(b"SIGMA");
+        assert!(claims(&buffer));
+    }
+}
