@@ -115,6 +115,15 @@ macro_rules! impl_formats {
                     return Err(Error::new(ErrorKind::Other, "File is empty or there was an error trying to load it."));
                 }
                 let ext = Some(filesystem::get_extension(filepath.as_ref().to_str().unwrap_or_default()).to_ascii_lowercase()).filter(|x| !x.is_empty());
+                // A parser whose `detect` claimed the file but whose `parse` then failed
+                // must not consume it. `detect` is a cheap heuristic over raw bytes, so a
+                // false positive there would otherwise hide the file from the parser that
+                // actually owns it -- a stray "SIGM" in HEVC payload once handed a
+                // Panasonic clip to the Sigma parser and cost it all of its lens metadata.
+                // Keep looking instead, and fall back to the first such claimant only if
+                // nothing else parses the file, which preserves the previous behaviour for
+                // a genuinely damaged file of that brand.
+                let mut fallback: Option<Input> = None;
                 {$(
                     let exts = <$class>::possible_extensions();
                     let mut check = true;
@@ -128,18 +137,24 @@ macro_rules! impl_formats {
                             // A parser that claimed the file but then failed to parse it is worth
                             // a line. The samples are dropped either way, and swallowing the error
                             // silently has twice left a metadata regression with no trace at all.
-                            let samples = match x.parse(stream, size, progress_cb, cancel_flag, options) {
-                                Ok(v) => Some(v),
+                            match x.parse(stream, size, &progress_cb, cancel_flag.clone(), options.clone()) {
+                                Ok(v) => return Ok(Input { samples: Some(v), inner: SupportedFormats::$name(x) }),
                                 Err(e) => {
                                     log::warn!("{} parser claimed {:?} but failed to parse it: {}",
                                                stringify!($name), filepath.as_ref(), e);
-                                    None
+                                    if fallback.is_none() {
+                                        fallback = Some(Input { samples: None, inner: SupportedFormats::$name(x) });
+                                    }
+                                    // The failed parse left the stream at an arbitrary offset.
+                                    stream.seek(SeekFrom::Start(0))?;
                                 }
-                            };
-                            return Ok(Input { samples, inner: SupportedFormats::$name(x) });
+                            }
                         }
                     }
                 )*}
+                if let Some(fb) = fallback {
+                    return Ok(fb);
+                }
                 // If nothing was detected, check if there's a file with the same name but different extension
                 if !options.dont_look_for_sidecar_files {
                     if let Some(path) = filepath.as_ref().to_str() {
