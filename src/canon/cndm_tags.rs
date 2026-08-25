@@ -69,10 +69,12 @@ pub fn get_tag(tag: u16, tag_data: &[u8]) -> TagDescription {
                 if x == 0 && y == 0 && z == 0 {
                     continue;
                 }
+                // Canon accelerometer axes are rotated 180 degrees around raw Y
+                // relative to the gyroscope before the shared yxZ orientation.
                 ret.push(Vector3 {
-                    x: half::f16::from_bits(x).to_f32(),
+                    x: -half::f16::from_bits(x).to_f32(),
                     y: half::f16::from_bits(y).to_f32(),
-                    z: half::f16::from_bits(z).to_f32(),
+                    z: -half::f16::from_bits(z).to_f32(),
                 });
             }
             Ok(ret)
@@ -166,4 +168,42 @@ pub fn extract_timezone(tag_data: &[u8]) -> Option<String> {
     if tz_hour == 0xFF || tz_minute == 0xFF { return None; }
     let sign = if tz_hour_sign == 0 { '+' } else { '-' };
     Some(format!("{}{:02}:{:02}", sign, tz_hour, tz_minute))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accelerometer_matches_separate_yaw_180_after_shared_orientation() {
+        let mut data = Vec::new();
+        for value in [1.0_f32, 2.0, 3.0] {
+            data.extend_from_slice(&half::f16::from_f32(value).to_bits().to_be_bytes());
+        }
+
+        let tag = get_tag(0xe220, &data);
+        let samples = match &tag.value {
+            TagValue::Vec_Vector3_f32(value) => value.get(),
+            _ => panic!("Canon accelerometer tag has an unexpected value type"),
+        };
+        let output = samples[0].clone().into_scaled(&1.0, &1.0).orient(b"yxZ");
+
+        assert_eq!([output.x, output.y, output.z], [-2.0, 1.0, -3.0]);
+    }
+
+    #[test]
+    fn gyroscope_axes_remain_unmodified() {
+        let mut data = Vec::new();
+        for value in [1.0_f32, 2.0, 3.0] {
+            data.extend_from_slice(&half::f16::from_f32(value).to_bits().to_be_bytes());
+        }
+
+        let tag = get_tag(0xe21f, &data);
+        let samples = match &tag.value {
+            TagValue::Vec_Vector3_f32(value) => value.get(),
+            _ => panic!("Canon gyroscope tag has an unexpected value type"),
+        };
+
+        assert_eq!([samples[0].x, samples[0].y, samples[0].z], [1.0, 2.0, 3.0]);
+    }
 }
