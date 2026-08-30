@@ -92,9 +92,9 @@ impl Sony {
                 if size > 0 {
                     progress_cb(file_position as f64 / size as f64);
                 }
-                if Self::detect_metadata(data) {
+                if let Some(payload_offset) = Self::metadata_payload_offset(data) {
                     let mut map = GroupedTagMap::new();
-                    if Self::parse_metadata(&data[0x1C..], &options, &mut map).is_ok() {
+                    if Self::parse_metadata(&data[payload_offset..], &options, &mut map).is_ok() {
                         info.tag_map = Some(map);
                         samples.push(info);
                         if options.probe_only {
@@ -368,15 +368,17 @@ impl Sony {
             None => return,
         };
 
+        if samples.is_empty() {
+            samples.push(SampleInfo::default());
+        }
+        samples[0].tag_map.get_or_insert_with(GroupedTagMap::new);
+
         let resolution_w = video_md.map(|v| v.width as u32).unwrap_or(0);
         let resolution_h = video_md.map(|v| v.height as u32).unwrap_or(0);
         let fps = video_md.map(|v| v.fps).unwrap_or(0.0);
 
         // Write video resolution to first sample's tag_map
         if let Some(vmd) = video_md {
-            if samples.is_empty() {
-                samples.push(SampleInfo::default());
-            }
             if let Some(ref mut map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
                 util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("video_width".into()), "Video output width", u32, |v| format!("{} px", v), vmd.width as u32, Vec::new()), options);
                 util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("video_height".into()), "Video output height", u32, |v| format!("{} px", v), vmd.height as u32, Vec::new()), options);
@@ -395,9 +397,6 @@ impl Sony {
 
         // First pass on frame 0
         let db_result: Option<(f32, f64, Option<f64>)> = {
-            if samples.is_empty() {
-                samples.push(SampleInfo::default());
-            }
             if let Some(ref mut map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
                 if let Some((matched_name, model_data)) = db.process_model("SONY", &model_name, map, options) {
                     self.model = Some(matched_name.to_string());
@@ -497,8 +496,13 @@ impl Sony {
         self.detect_slowmo(samples, options, video_md);
     }
 
-    fn detect_metadata(data: &[u8]) -> bool {
-        data.len() > 0x1C && data[0..2] == [0x00, 0x1C]
+    fn metadata_payload_offset(data: &[u8]) -> Option<usize> {
+        let offset = match data.get(..2)? {
+            [0x00, 0x08] => 0x08,
+            [0x00, 0x1C] => 0x1C,
+            _ => return None,
+        };
+        (data.len() > offset).then_some(offset)
     }
 
     pub fn parse_metadata(data: &[u8], options: &crate::InputOptions, map: &mut GroupedTagMap) -> Result<()> {
@@ -590,6 +594,42 @@ fn emit_pixel_focal_lengths(samples: &mut [SampleInfo], unit_pixel_focal_length:
 mod tests {
     use super::{emit_pixel_focal_lengths, resolve_video_unit_pixel_focal_length};
     use crate::{tag, tags_impl::*, util::VideoMetadata, InputOptions, SampleInfo};
+
+    #[test]
+    fn accepts_legacy_and_current_rtmd_headers() {
+        let legacy = [0x00, 0x08, 0, 0, 0, 0, 0, 0, 0x06];
+        let current = {
+            let mut data = [0u8; 29];
+            data[1] = 0x1C;
+            data[28] = 0x06;
+            data
+        };
+
+        assert_eq!(super::Sony::metadata_payload_offset(&legacy), Some(0x08));
+        assert_eq!(super::Sony::metadata_payload_offset(&current), Some(0x1C));
+        assert_eq!(super::Sony::metadata_payload_offset(&[0x00, 0x10, 0]), None);
+    }
+
+    #[test]
+    fn camera_db_fallback_creates_tag_map_without_rtmd() {
+        let mut sony = super::Sony::default();
+        sony.model = Some("ILCE-6100".to_owned());
+        let mut samples = Vec::new();
+        let mut options = InputOptions::default();
+        options.camera_db_path = Some(format!("{}/camera_db", env!("CARGO_MANIFEST_DIR")));
+
+        sony.process_case2_json_fallback(
+            &mut samples,
+            &options,
+            Some(&VideoMetadata { width: 3840, height: 2160, fps: 25.0, ..VideoMetadata::default() }),
+        );
+
+        let map = samples[0].tag_map.as_ref().unwrap();
+        let sensor_width: Option<f32> = map.get(&GroupId::Default).unwrap().get_t(TagId::SensorWidth).copied();
+        let unit_pixel_focal_length: Option<f64> = map.get(&GroupId::Lens).unwrap().get_t(TagId::Custom("unit_pixel_focal_length".into())).copied();
+        assert_eq!(sensor_width, Some(23.5));
+        assert_eq!(unit_pixel_focal_length, Some(3840.0 / 23.5));
+    }
 
     #[test]
     fn derives_unit_pixel_focal_length_from_video_sensor_geometry() {
