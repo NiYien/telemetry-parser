@@ -69,12 +69,12 @@ pub fn get_tag(tag: u16, tag_data: &[u8]) -> TagDescription {
                 if x == 0 && y == 0 && z == 0 {
                     continue;
                 }
-                // Canon accelerometer axes are rotated 180 degrees around raw Y
-                // relative to the gyroscope before the shared yxZ orientation.
+                // Canon accelerometer raw X has the opposite polarity from the gyroscope.
+                // Flip only X before applying the shared yxZ orientation.
                 ret.push(Vector3 {
                     x: -half::f16::from_bits(x).to_f32(),
                     y: half::f16::from_bits(y).to_f32(),
-                    z: -half::f16::from_bits(z).to_f32(),
+                    z: half::f16::from_bits(z).to_f32(),
                 });
             }
             Ok(ret)
@@ -175,7 +175,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accelerometer_matches_separate_yaw_180_after_shared_orientation() {
+    fn accelerometer_uses_yxz_after_shared_orientation() {
         let mut data = Vec::new();
         for value in [1.0_f32, 2.0, 3.0] {
             data.extend_from_slice(&half::f16::from_f32(value).to_bits().to_be_bytes());
@@ -186,9 +186,10 @@ mod tests {
             TagValue::Vec_Vector3_f32(value) => value.get(),
             _ => panic!("Canon accelerometer tag has an unexpected value type"),
         };
+        assert_eq!([samples[0].x, samples[0].y, samples[0].z], [-1.0, 2.0, 3.0]);
         let output = samples[0].clone().into_scaled(&1.0, &1.0).orient(b"yxZ");
 
-        assert_eq!([output.x, output.y, output.z], [-2.0, 1.0, -3.0]);
+        assert_eq!([output.x, output.y, output.z], [-2.0, 1.0, 3.0]);
     }
 
     #[test]
