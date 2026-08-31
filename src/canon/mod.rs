@@ -15,13 +15,12 @@ pub mod exif;
 
 /// Whether an APS-C-only lens (EF-S / RF-S) on this body implies a forced sensor crop.
 ///
-/// Canon full-frame bodies switch to a 1.6x crop automatically when an APS-C-only lens
-/// is mounted, but first-generation RF bodies (EOS R, RP) and older DSLRs never write
-/// MakerNote 0x4049 — the only signal `camera_db`'s crop rule keys on. Lens identity
-/// covers those bodies.
+/// Canon full-frame bodies switch to an APS-C recording area automatically when an
+/// APS-C-only lens is mounted. Lens identity is only a fallback when neither precise
+/// CNDM geometry nor a dedicated MakerNote signal is available.
 ///
 /// The `sensor_w` guard is mandatory rather than defensive: `canon.json` also defines a
-/// `canon_crop` rule for APS-C bodies (`{"m":["R10","R7"],"tag":{"canon_crop":true},"c":1.8}`),
+/// movie-crop rule for APS-C bodies (`{"m":["R10","R7"],"tag":{"canon_movie_crop":true},"c":1.8}`),
 /// where an RF-S lens is the native configuration and not a crop mode — without the guard
 /// those bodies would be handed an extra 1.8x factor. The 35.0 threshold separates APS-C
 /// (22.3) and Super35 (24.6) sensor widths from full-frame (35.9).
@@ -29,15 +28,53 @@ pub(crate) fn aps_c_lens_implies_crop(lens_model: &str, sensor_w: f32) -> bool {
     (lens_model.starts_with("EF-S") || lens_model.starts_with("RF-S")) && sensor_w >= 35.0
 }
 
-/// Which signal decided crop mode, for the diagnostic log. When both fire the
-/// MakerNote flag is reported, being the in-camera signal rather than an inference.
-pub(crate) fn crop_source_label(maker_note_crop: bool, lens_implies_crop: bool) -> &'static str {
-    if maker_note_crop {
-        "tag_0x4049"
-    } else if lens_implies_crop {
-        "aps_c_lens"
+fn canon_aspect_crop_factor(aspect_ratio: Option<u32>) -> Option<f64> {
+    match aspect_ratio {
+        Some(12) => Some(1.3),
+        Some(13) => Some(1.6),
+        _ => None,
+    }
+}
+
+fn canon_aspect_view_angle(aspect_ratio: Option<u32>) -> Option<&'static str> {
+    match aspect_ratio {
+        Some(12) => Some("APS-H"),
+        Some(13) => Some("APS-C"),
+        _ => None,
+    }
+}
+
+/// Returns the physical capture size reported by CNDM when the complete geometry is sane.
+fn cndm_effective_geometry(map: &GroupedTagMap) -> Option<(f64, f64)> {
+    let default = map.get(&GroupId::Default)?;
+    let imager = map.get(&GroupId::Imager)?;
+    let width_mm = *(default.get_t(TagId::SensorWidth) as Option<&f32>)? as f64;
+    let height_mm = *(default.get_t(TagId::SensorHeight) as Option<&f32>)? as f64;
+    let width_px = *(imager.get_t(TagId::PixelWidth) as Option<&u32>)?;
+    let height_px = *(imager.get_t(TagId::PixelHeight) as Option<&u32>)?;
+
+    if width_mm.is_finite()
+        && height_mm.is_finite()
+        && width_mm > 0.0
+        && height_mm > 0.0
+        && width_px > 0
+        && height_px > 0
+    {
+        Some((width_mm, height_mm))
     } else {
-        "none"
+        None
+    }
+}
+
+fn cndm_crop_projection(sensor_width_mm: f32, output_width: u32, geometry: (f64, f64)) -> Option<(f64, f64)> {
+    let effective_width_mm = geometry.0;
+    if sensor_width_mm > 0.0 && output_width > 0 && effective_width_mm > 0.0 {
+        Some((
+            sensor_width_mm as f64 / effective_width_mm,
+            output_width as f64 / effective_width_mm,
+        ))
+    } else {
+        None
     }
 }
 
@@ -352,7 +389,7 @@ impl Canon {
             util::get_video_metadata(stream, size).ok()
         };
 
-        // Parse Canon EXIF for canon_fine, canon_crop, and fallback metadata (MP4/MOV only).
+        // Parse Canon EXIF for crop-mode signals and fallback metadata (MP4/MOV only).
         // The wrapper box differs by container (MP4 -> uuid, MOV -> udta); see exif.rs.
         stream.seek(SeekFrom::Start(0))?;
         let exif_data = if is_mxf { Err(Error::new(ErrorKind::NotFound, "MXF has no UUID EXIF")) } else { exif::parse_canon_exif(stream, size) };
@@ -436,10 +473,18 @@ impl Canon {
                 samples[0].tag_map = Some(map);
             }
 
-            // Always write canon_fine and canon_crop to first sample's tag_map
+            // Keep the independent MakerNote crop signals separate in the parsed output.
             if let Some(ref mut map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
                 util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_fine".into()), "Canon Fine mode", bool, |v| v.to_string(), exif.canon_fine, Vec::new()), options);
-                util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_crop".into()), "Canon Crop mode", bool, |v| v.to_string(), exif.canon_crop, Vec::new()), options);
+                if let Some(movie_crop) = exif.movie_crop {
+                    util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_movie_crop".into()), "Canon movie cropping", bool, |v| v.to_string(), movie_crop, Vec::new()), options);
+                }
+                if let Some(aspect_ratio) = exif.aspect_ratio {
+                    util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_aspect_ratio".into()), "Canon aspect/crop mode", u32, |v| v.to_string(), aspect_ratio, Vec::new()), options);
+                }
+                if let Some(crop_margins) = exif.crop_margins {
+                    util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_crop_margins".into()), "Canon crop margins", Vec_u16, |v| format!("{:?}", v), crop_margins.to_vec(), Vec::new()), options);
+                }
             }
         }
 
@@ -503,7 +548,9 @@ impl Canon {
         let resolution_h_video = video_md.map(|v| v.height as u32).unwrap_or(0);
         let fps = video_md.map(|v| v.fps).unwrap_or(0.0);
         let canon_fine = exif_data.as_ref().map_or(false, |e| e.canon_fine);
-        let canon_crop_flag = exif_data.as_ref().map_or(false, |e| e.canon_crop);
+        let canon_movie_crop = exif_data.as_ref().and_then(|e| e.movie_crop);
+        let canon_aspect_ratio = exif_data.as_ref().and_then(|e| e.aspect_ratio);
+        let canon_crop_margins = exif_data.as_ref().and_then(|e| e.crop_margins);
         // EXIF LensModel (ExifIFD tag 0xA434). Taken from CanonExifData rather than the
         // sample tag_map: the tag_map's Lens/DisplayName entry is only written on the
         // no-CNDM-samples path, so bodies that do emit CNDM samples may leave it empty
@@ -515,7 +562,7 @@ impl Canon {
             if let Ok(db) = crate::camera_db::CameraDatabase::load(db_path) {
                 if let Some(model_name) = &self.model.clone() {
                     // First pass: extract model info, crop, sensor_width from first sample
-                    let db_result: Option<(f32, f64, Option<f64>, String)> = {
+                    let db_result: Option<(f32, f64, Option<f64>, String, bool)> = {
                         if let Some(ref mut map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
                             if let Some((matched_name, model_data)) = db.process_model("CANON", model_name, map, options) {
                                 self.model = Some(matched_name.to_string());
@@ -526,41 +573,69 @@ impl Canon {
                                     .cloned()
                                     .unwrap_or_default();
 
-                                // View angle: determined by JSON crop rules via tag conditions
-                                let view_angle: Option<&str> = None;
+                                let cndm_geometry = cndm_effective_geometry(map);
+                                let cndm_projection = cndm_geometry
+                                    .and_then(|geometry| cndm_crop_projection(sensor_w, resolution_w_video, geometry));
+                                let view_angle = canon_aspect_view_angle(canon_aspect_ratio);
 
-                                // Build tags for canon_fine / canon_crop
+                                // Keep each crop signal separate so a disabled movie-crop setting
+                                // cannot negate an APS-C/S35 capture mode from another source.
                                 let mut tags = std::collections::HashMap::new();
                                 if canon_fine {
                                     tags.insert("canon_fine".to_string(), serde_json::Value::Bool(true));
                                 }
-                                // Bodies that never write MakerNote 0x4049 (EOS R / RP and older)
-                                // still crop when an APS-C-only lens is mounted; see
-                                // `aps_c_lens_implies_crop` for the guard rationale.
+                                if canon_movie_crop == Some(true) {
+                                    tags.insert("canon_movie_crop".to_string(), serde_json::Value::Bool(true));
+                                }
+                                if let Some(aspect_ratio) = canon_aspect_ratio {
+                                    tags.insert("canon_aspect_ratio".to_string(), serde_json::Value::from(aspect_ratio));
+                                }
                                 let lens_implies_crop =
                                     aps_c_lens_implies_crop(exif_lens_model, sensor_w);
-                                let crop_source = crop_source_label(canon_crop_flag, lens_implies_crop);
-                                if canon_crop_flag || lens_implies_crop {
-                                    tags.insert("canon_crop".to_string(), serde_json::Value::Bool(true));
-                                }
 
-                                // Use MXF-derived crop if available, otherwise fall back to DB crop
+                                // CNDM reports the physical capture window after all sensor-mode
+                                // choices. It is authoritative and must not be multiplied by any
+                                // MakerNote crop flag a second time.
                                 let has_mxf_crop = map.get(&GroupId::Default)
                                     .map_or(false, |m| m.contains_key(&TagId::Custom("crop_factor".into())));
-                                let effective_crop = if has_mxf_crop {
-                                    // MXF crop already written by Canvas parsing
+                                let mxf_crop = if has_mxf_crop {
                                     map.get(&GroupId::Default)
                                         .and_then(|m| m.get_t(TagId::Custom("crop_factor".into())) as Option<&f64>)
                                         .copied()
-                                        .unwrap_or(1.0)
                                 } else {
-                                    let c = db.process_crop("CANON", matched_name, resolution_w_video, resolution_h_video, fps, view_angle, &tags, map, options);
-                                    // Canon always writes crop_factor (even default 1.0)
-                                    if db.match_crop("CANON", matched_name, resolution_w_video, resolution_h_video, fps, view_angle, &tags).is_none() {
-                                        util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{:.4}", v), 1.0, Vec::new()), options);
-                                    }
-                                    c
+                                    None
                                 };
+                                let db_crop = db.match_crop(
+                                    "CANON",
+                                    matched_name,
+                                    resolution_w_video,
+                                    resolution_h_video,
+                                    fps,
+                                    view_angle,
+                                    &tags,
+                                );
+                                let aspect_crop = canon_aspect_crop_factor(canon_aspect_ratio);
+                                let (effective_crop, crop_source) = if let Some((crop, _)) = cndm_projection {
+                                    (crop, "cndm_geometry")
+                                } else if let Some(crop) = mxf_crop {
+                                    (crop, "mxf_35mm_equivalent")
+                                } else if let Some(crop) = aspect_crop {
+                                    (crop, "tag_0x009a")
+                                } else if let Some(crop) = db_crop {
+                                    (
+                                        crop,
+                                        if canon_movie_crop == Some(true) {
+                                            "tag_0x4049"
+                                        } else {
+                                            "camera_db"
+                                        },
+                                    )
+                                } else if lens_implies_crop {
+                                    (1.6, "aps_c_lens")
+                                } else {
+                                    (1.0, "none")
+                                };
+                                util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{:.4}", v), effective_crop, Vec::new()), options);
 
                                 // Readout: use CNDM sensor pixels for resolution if available
                                 if self.frame_readout_time.is_none() {
@@ -578,8 +653,14 @@ impl Canon {
                                 }
 
                                 // Compute unit_pixel_focal_length
-                                let unit_px_fl = if resolution_w_video > 0 && sensor_w > 0.0 {
-                                    Some(resolution_w_video as f64 * effective_crop / sensor_w as f64)
+                                let unit_px_fl = if resolution_w_video > 0 {
+                                    if let Some((_, upfl)) = cndm_projection {
+                                        Some(upfl)
+                                    } else if sensor_w > 0.0 {
+                                        Some(resolution_w_video as f64 * effective_crop / sensor_w as f64)
+                                    } else {
+                                        None
+                                    }
                                 } else {
                                     None
                                 };
@@ -589,10 +670,14 @@ impl Canon {
                                 // was decided so focal-length regressions are diagnosable from a
                                 // log alone.
                                 log::info!(
-                                    "Canon: crop mode: source={} lens={:?} sensor_w={:.1} res={}x{} crop={:.4} upfl={}",
+                                    "Canon: crop mode: source={} movie_crop={:?} aspect={:?} margins={:?} lens={:?} sensor_w={:.4} cndm_geometry={:?} res={}x{} crop={:.4} upfl={}",
                                     crop_source,
+                                    canon_movie_crop,
+                                    canon_aspect_ratio,
+                                    canon_crop_margins,
                                     exif_lens_model,
                                     sensor_w,
+                                    cndm_geometry,
                                     resolution_w_video,
                                     resolution_h_video,
                                     effective_crop,
@@ -604,21 +689,25 @@ impl Canon {
                                     util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), upfl, Vec::new()), options);
                                 }
 
-                                // Write PixelFocalLength for first sample based on its own FocalLength or user-provided
-                                if let Some(upfl) = unit_px_fl {
-                                    let fl_from_file = map.get(&GroupId::Lens)
-                                        .and_then(|m| m.get_t(TagId::FocalLength) as Option<&f32>)
-                                        .map(|v| *v as f64);
-                                    let fl = fl_from_file.or(options.user_focal_length);
-                                    if let Some(fl) = fl {
-                                        if fl > 0.0 {
-                                            let px_fl = (fl * upfl) as f32;
-                                            util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{:.2}", v), px_fl, Vec::new()), options);
+                                // Preserve precise CNDM geometry as the source of truth. Gyroflow
+                                // derives pixel focal length from focal length, pixel pitch, and
+                                // capture area when this synthetic tag is absent.
+                                if cndm_projection.is_none() {
+                                    if let Some(upfl) = unit_px_fl {
+                                        let fl_from_file = map.get(&GroupId::Lens)
+                                            .and_then(|m| m.get_t(TagId::FocalLength) as Option<&f32>)
+                                            .map(|v| *v as f64);
+                                        let fl = fl_from_file.or(options.user_focal_length);
+                                        if let Some(fl) = fl {
+                                            if fl > 0.0 {
+                                                let px_fl = (fl * upfl) as f32;
+                                                util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{:.2}", v), px_fl, Vec::new()), options);
+                                            }
                                         }
                                     }
                                 }
 
-                                Some((sensor_w, effective_crop, unit_px_fl, lens_model))
+                                Some((sensor_w, effective_crop, unit_px_fl, lens_model, cndm_projection.is_some()))
                             } else {
                                 None
                             }
@@ -628,7 +717,7 @@ impl Canon {
                     }; // first-sample borrow released here
 
                     // Second pass: write crop_factor, unit_pixel_focal_length, and PixelFocalLength to remaining samples
-                    if let Some((_sensor_w, effective_crop, unit_px_fl, _lens_model)) = db_result {
+                    if let Some((_sensor_w, effective_crop, unit_px_fl, _lens_model, has_cndm_geometry)) = db_result {
                         for sample in samples.iter_mut().skip(1) {
                             if let Some(ref mut smap) = sample.tag_map {
                                 // Write crop_factor (same for all frames)
@@ -643,16 +732,18 @@ impl Canon {
                                     }
                                 }
 
-                                // Write PixelFocalLength based on THIS frame's FocalLength or user-provided
-                                if let Some(upfl) = unit_px_fl {
-                                    let fl_from_file = smap.get(&GroupId::Lens)
-                                        .and_then(|m| m.get_t(TagId::FocalLength) as Option<&f32>)
-                                        .map(|v| *v as f64);
-                                    let fl = fl_from_file.or(options.user_focal_length);
-                                    if let Some(fl) = fl {
-                                        if fl > 0.0 {
-                                            let px_fl = (fl * upfl) as f32;
-                                            util::insert_tag(smap, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{:.2}", v), px_fl, Vec::new()), options);
+                                // Let Gyroflow derive PixelFocalLength from precise CNDM geometry.
+                                if !has_cndm_geometry {
+                                    if let Some(upfl) = unit_px_fl {
+                                        let fl_from_file = smap.get(&GroupId::Lens)
+                                            .and_then(|m| m.get_t(TagId::FocalLength) as Option<&f32>)
+                                            .map(|v| *v as f64);
+                                        let fl = fl_from_file.or(options.user_focal_length);
+                                        if let Some(fl) = fl {
+                                            if fl > 0.0 {
+                                                let px_fl = (fl * upfl) as f32;
+                                                util::insert_tag(smap, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{:.2}", v), px_fl, Vec::new()), options);
+                                            }
                                         }
                                     }
                                 }
@@ -1796,7 +1887,7 @@ mod tests {
     #[test]
     fn aps_c_lens_on_aps_c_body_does_not_imply_crop() {
         // RF-S on an R7/R10 is the native configuration. canon.json defines a separate
-        // 1.8x canon_crop rule for those bodies, so letting lens identity fire it here
+        // 1.8x movie-crop rule for those bodies, so letting lens identity fire it here
         // would push the focal length further from truth, not closer.
         assert!(!aps_c_lens_implies_crop("RF-S18-150mm F3.5-6.3 IS STM", 22.3));
     }
@@ -1819,11 +1910,26 @@ mod tests {
     }
 
     #[test]
-    fn crop_source_label_reports_the_deciding_signal() {
-        // MakerNote wins the label when both fire — it is the in-camera signal.
-        assert_eq!(crop_source_label(true, true), "tag_0x4049");
-        assert_eq!(crop_source_label(true, false), "tag_0x4049");
-        assert_eq!(crop_source_label(false, true), "aps_c_lens");
-        assert_eq!(crop_source_label(false, false), "none");
+    fn aspect_info_maps_only_explicit_sensor_crop_modes() {
+        assert_eq!(canon_aspect_crop_factor(Some(12)), Some(1.3));
+        assert_eq!(canon_aspect_crop_factor(Some(13)), Some(1.6));
+        assert_eq!(canon_aspect_crop_factor(Some(7)), None);
+        assert_eq!(canon_aspect_crop_factor(None), None);
+        assert_eq!(canon_aspect_view_angle(Some(12)), Some("APS-H"));
+        assert_eq!(canon_aspect_view_angle(Some(13)), Some("APS-C"));
+    }
+
+    #[test]
+    fn cndm_geometry_drives_c50_crop_and_projection() {
+        let (crop, upfl) = cndm_crop_projection(
+            35.9,
+            3840,
+            (24.36552, 13.70496),
+        )
+        .expect("valid CNDM geometry");
+
+        assert!((crop - 1.4734).abs() < 0.0001);
+        assert!((upfl - 157.5998).abs() < 0.0001);
+        assert!((56.0 * upfl - 8825.59).abs() < 0.1);
     }
 }

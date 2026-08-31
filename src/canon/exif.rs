@@ -2,7 +2,7 @@
 // Copyright © 2025 Adrian <adrian.eddy at gmail>
 
 //! Minimal TIFF/EXIF parser for the Canon metadata atom.
-//! Extracts Model, FocalLength, LensModel, and Canon MakerNotes (canon_fine, canon_crop).
+//! Extracts Model, FocalLength, LensModel, and selected Canon MakerNotes.
 //!
 //! Canon stores the same child layout (CNCV / CNDM / CNTH, optionally CNOP) under two
 //! different wrapper boxes depending on the container format: MP4 uses a private `uuid`
@@ -26,7 +26,13 @@ pub struct CanonExifData {
     pub focal_length: Option<f64>,
     pub lens_model: Option<String>,
     pub canon_fine: bool,
-    pub canon_crop: bool,
+    /// MakerNote 0x4049: the dedicated movie-cropping setting.
+    /// `None` means the tag was absent or carried an unknown value.
+    pub movie_crop: Option<bool>,
+    /// MakerNote 0x009a AspectInfo element 0.
+    pub aspect_ratio: Option<u32>,
+    /// MakerNote 0x0098 CropInfo: left, right, top, bottom margins.
+    pub crop_margins: Option<[u16; 4]>,
     pub datetime_original: Option<String>,
     pub offset_time_original: Option<String>,
     pub subsec_time_original: Option<String>,
@@ -323,32 +329,54 @@ fn parse_ifd(tiff_data: &[u8], offset: usize, is_le: bool, callback: &mut dyn Fn
     Ok(())
 }
 
-/// Parse Canon MakerNotes IFD to extract tag 0x0034 and 0x4049.
+/// Parse the Canon MakerNotes IFD entries needed for crop-mode resolution.
 fn parse_canon_makernotes(tiff_data: &[u8], offset: usize, _count: usize, is_le: bool, result: &mut CanonExifData) {
     // Canon MakerNotes is a standard IFD structure starting at the offset
     let _ = parse_ifd(tiff_data, offset, is_le, &mut |tag, typ, count, value_data, _value_offset| {
-        match tag {
-            0x0034 => {
-                // int32u array. Check element[3] & 0x100 for Fine mode.
-                if typ == 4 && count >= 4 && value_data.len() >= 16 {
-                    let element3 = read_u32(value_data, 12, is_le);
-                    if element3 & 0x100 != 0 {
-                        result.canon_fine = true;
-                    }
-                }
-            }
-            0x4049 => {
-                // int16u[4]. Check element[1] == 1 for crop mode.
-                if count >= 4 && value_data.len() >= 8 {
-                    let element1 = read_u16(value_data, 2, is_le);
-                    if element1 == 1 {
-                        result.canon_crop = true;
-                    }
-                }
-            }
-            _ => {}
-        }
+        parse_canon_makernote_entry(tag, typ, count, value_data, is_le, result);
     });
+}
+
+fn parse_canon_makernote_entry(tag: u16, typ: u16, count: usize, value_data: &[u8], is_le: bool, result: &mut CanonExifData) {
+    match tag {
+        0x0034 => {
+            // int32u array. Check element[3] & 0x100 for Fine mode.
+            if typ == 4 && count >= 4 && value_data.len() >= 16 {
+                let element3 = read_u32(value_data, 12, is_le);
+                if element3 & 0x100 != 0 {
+                    result.canon_fine = true;
+                }
+            }
+        }
+        0x0098 => {
+            // CropInfo int16u[4]: left, right, top, bottom margins.
+            if typ == 3 && count >= 4 && value_data.len() >= 8 {
+                result.crop_margins = Some([
+                    read_u16(value_data, 0, is_le),
+                    read_u16(value_data, 2, is_le),
+                    read_u16(value_data, 4, is_le),
+                    read_u16(value_data, 6, is_le),
+                ]);
+            }
+        }
+        0x009a => {
+            // AspectInfo int32u array. Element 0 includes APS-H (12) and APS-C (13).
+            if typ == 4 && count >= 1 && value_data.len() >= 4 {
+                result.aspect_ratio = Some(read_u32(value_data, 0, is_le));
+            }
+        }
+        0x4049 => {
+            // Dedicated movie-cropping setting: element[1] is 0=disabled, 1=enabled.
+            if typ == 3 && count >= 4 && value_data.len() >= 8 {
+                result.movie_crop = match read_u16(value_data, 2, is_le) {
+                    0 => Some(false),
+                    1 => Some(true),
+                    _ => None,
+                };
+            }
+        }
+        _ => {}
+    }
 }
 
 // ---- Helper functions ----
@@ -451,6 +479,46 @@ mod tests {
     fn run(file: &[u8]) -> Result<CanonExifData> {
         let len = file.len();
         parse_canon_exif(&mut Cursor::new(file.to_vec()), len)
+    }
+
+    #[test]
+    fn crop_makernotes_keep_independent_meanings() {
+        let mut data = CanonExifData::default();
+
+        let crop_info: Vec<u8> = [10u16, 20, 30, 40]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        parse_canon_makernote_entry(0x0098, 3, 4, &crop_info, true, &mut data);
+
+        parse_canon_makernote_entry(0x009a, 4, 1, &13u32.to_le_bytes(), true, &mut data);
+
+        let movie_crop_off: Vec<u8> = [8u16, 0, 0, 0]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        parse_canon_makernote_entry(0x4049, 3, 4, &movie_crop_off, true, &mut data);
+
+        assert_eq!(data.crop_margins, Some([10, 20, 30, 40]));
+        assert_eq!(data.aspect_ratio, Some(13));
+        assert_eq!(data.movie_crop, Some(false));
+    }
+
+    #[test]
+    fn movie_crop_distinguishes_enabled_disabled_and_unknown() {
+        fn parse_element1(value: u16) -> Option<bool> {
+            let raw: Vec<u8> = [8u16, value, 0, value]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            let mut data = CanonExifData::default();
+            parse_canon_makernote_entry(0x4049, 3, 4, &raw, true, &mut data);
+            data.movie_crop
+        }
+
+        assert_eq!(parse_element1(0), Some(false));
+        assert_eq!(parse_element1(1), Some(true));
+        assert_eq!(parse_element1(2), None);
     }
 
     #[test]
