@@ -20,6 +20,7 @@ declare_groups! {
     CameraOrientation,
     ImageOrientation,
     Cooke,
+    LensBreathing,
 }
 
 declare_ids! {
@@ -91,6 +92,7 @@ declare_ids! {
     Enabled,
     Data,
     Data2,
+    Rig,
     Unit,
     Matrix,
     Temperature,
