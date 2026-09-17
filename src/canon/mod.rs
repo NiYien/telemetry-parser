@@ -236,7 +236,10 @@ impl Canon {
                     if let Err(e) = || -> Result<()> {
                         let mut slice = Cursor::new(&data);
                         if self.is_crm {
+                            let mut ctmd_focal = None;
+                            let initial_sample_count = samples.len();
                             while let Ok(length) = slice.read_u32::<LittleEndian>() {
+                                if length < 8 { break; }
                                 let length = (length - 8) as usize;
                                 let metadata_id = slice.read_u32::<LittleEndian>()?;
                                 if slice.position() as usize + length > data.len() {
@@ -247,6 +250,7 @@ impl Canon {
                                 slice.seek_relative(length as _)?;
                                 let mut d = Cursor::new(&data_inner);
                                 match metadata_id {
+                                    4 => ctmd_focal = crm_ctmd_focal_length(data_inner),
                                     0x0000000D => { // AcquisitionMetadataPack
                                         let _version  = d.read_u16::<LittleEndian>()?;
                                         let _reserved = d.read_u16::<LittleEndian>()?;
@@ -260,6 +264,19 @@ impl Canon {
                                     }
                                     _ => {
                                         // println!("Unknown CRM data: {metadata_id}, {}", pretty_hex::pretty_hex(&data_inner));
+                                    }
+                                }
+                            }
+                            // Older EOS CRM uses CTMD FocalInfo instead of an acquisition pack.
+                            // Keep the container timestamp so zooms remain aligned with the video.
+                            if samples.len() == initial_sample_count {
+                                if let Some(focal) = ctmd_focal {
+                                    let mut map = GroupedTagMap::new();
+                                    util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{:.2} mm", v), focal, Vec::new()), &options);
+                                    info.tag_map = Some(map);
+                                    samples.push(info.clone());
+                                    if options.probe_only {
+                                        cancel_flag2.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -389,7 +406,7 @@ impl Canon {
             util::get_video_metadata(stream, size).ok()
         };
 
-        // Parse Canon EXIF for crop-mode signals and fallback metadata (MP4/MOV only).
+        // Parse Canon EXIF for crop-mode signals and fallback metadata (MP4/MOV/CRM).
         // The wrapper box differs by container (MP4 -> uuid, MOV -> udta); see exif.rs.
         stream.seek(SeekFrom::Start(0))?;
         let exif_data = if is_mxf { Err(Error::new(ErrorKind::NotFound, "MXF has no UUID EXIF")) } else { exif::parse_canon_exif(stream, size) };
@@ -473,8 +490,28 @@ impl Canon {
                 samples[0].tag_map = Some(map);
             }
 
+            // CRM CMT blocks describe the clip; timed CTMD/acquisition values take priority.
+            if self.is_crm {
+                if let Some(map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
+                    if !map.get(&GroupId::Lens).is_some_and(|m| m.contains_key(&TagId::FocalLength)) {
+                        if let Some(fl) = exif.focal_length {
+                            util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{:.2} mm", v), fl as f32, Vec::new()), options);
+                        }
+                    }
+                    if !map.get(&GroupId::Lens).is_some_and(|m| m.contains_key(&TagId::DisplayName)) {
+                        if let Some(lens) = &exif.lens_model {
+                            util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::DisplayName, "Lens model", String, |v| v.to_string(), lens.clone(), Vec::new()), options);
+                            self.lens = Some(lens.clone());
+                        }
+                    }
+                }
+            }
+
             // Keep the independent MakerNote crop signals separate in the parsed output.
             if let Some(ref mut map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
+                if self.is_crm && exif.from_cmt {
+                    util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_cmt".into()), "Canon CMT metadata", bool, |v| v.to_string(), true, Vec::new()), options);
+                }
                 util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_fine".into()), "Canon Fine mode", bool, |v| v.to_string(), exif.canon_fine, Vec::new()), options);
                 if let Some(movie_crop) = exif.movie_crop {
                     util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_movie_crop".into()), "Canon movie cropping", bool, |v| v.to_string(), movie_crop, Vec::new()), options);
@@ -806,6 +843,15 @@ impl Canon {
             }
         }
     }
+}
+
+fn crm_ctmd_focal_length(data: &[u8]) -> Option<f32> {
+    // CTMD records have a four-byte version/reserved prefix, then a u16 rational.
+    let value = data.get(4..8)?;
+    let num = u16::from_le_bytes([value[0], value[1]]);
+    let den = u16::from_le_bytes([value[2], value[3]]);
+    (num > 0 && num != u16::MAX && den > 0 && den != u16::MAX)
+        .then_some(num as f32 / den as f32)
 }
 
 pub fn parse_metadata<T: Read + Seek>(stream: &mut T, _size: usize, options: &crate::InputOptions) -> Result<GroupedTagMap> {
@@ -1907,6 +1953,16 @@ mod tests {
     #[test]
     fn missing_lens_model_is_not_a_crop_signal() {
         assert!(!aps_c_lens_implies_crop("", 35.9));
+    }
+
+    #[test]
+    fn crm_ctmd_focal_rational_and_invalid_values() {
+        let record = |num: u16, den: u16| [vec![0, 1, 255, 255], num.to_le_bytes().to_vec(), den.to_le_bytes().to_vec()].concat();
+        assert_eq!(crm_ctmd_focal_length(&record(24, 1)), Some(24.0));
+        assert_eq!(crm_ctmd_focal_length(&record(245, 10)), Some(24.5));
+        assert_eq!(crm_ctmd_focal_length(&record(24, 0)), None);
+        assert_eq!(crm_ctmd_focal_length(&record(u16::MAX, u16::MAX)), None);
+        assert_eq!(crm_ctmd_focal_length(&[0; 7]), None);
     }
 
     #[test]

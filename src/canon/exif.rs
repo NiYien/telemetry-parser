@@ -7,7 +7,8 @@
 //! Canon stores the same child layout (CNCV / CNDM / CNTH, optionally CNOP) under two
 //! different wrapper boxes depending on the container format: MP4 uses a private `uuid`
 //! box, MOV uses QuickTime's native `udta` box. Both wrappers feed the identical
-//! `CNTH -> CNDA -> JPEG APP1 -> TIFF IFD0` chain below.
+//! `CNTH -> CNDA -> JPEG APP1 -> TIFF IFD0` chain below. CRM also stores IFD0,
+//! ExifIFD, and Canon MakerNotes in separate TIFF blocks (CMT1, CMT2, CMT3).
 
 use std::io::*;
 // byteorder not needed here - using manual byte parsing for TIFF IFD
@@ -22,6 +23,7 @@ const CANON_UUID: [u8; 16] = [
 /// Data extracted from Canon UUID EXIF.
 #[derive(Debug, Default)]
 pub struct CanonExifData {
+    pub from_cmt: bool,
     pub model: Option<String>,
     pub focal_length: Option<f64>,
     pub lens_model: Option<String>,
@@ -135,6 +137,7 @@ fn find_moov_atom<T: Read + Seek>(stream: &mut T, file_size: usize) -> Result<Ve
 fn parse_canon_wrapper_content(data: &[u8]) -> Result<CanonExifData> {
     let mut cursor = Cursor::new(data);
     let len = data.len() as u64;
+    let mut cmt_blocks = [None; 3];
 
     while cursor.position() < len {
         let pos = cursor.position() as usize;
@@ -143,6 +146,16 @@ fn parse_canon_wrapper_content(data: &[u8]) -> Result<CanonExifData> {
         let (typ, _pos, size, header_size) = util::read_box(&mut cursor)?;
         let content_size = size as i64 - header_size;
         if content_size <= 0 { break; }
+
+        let start = cursor.position() as usize;
+        let end = start.checked_add(content_size as usize)
+            .filter(|end| *end <= data.len())
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Truncated Canon metadata box"))?;
+        for (index, name) in ["CMT1", "CMT2", "CMT3"].iter().enumerate() {
+            if typ == util::fourcc(name) && cmt_blocks[index].is_none() {
+                cmt_blocks[index] = Some(&data[start..end]);
+            }
+        }
 
         if typ == util::fourcc("CNTH") {
             let start = cursor.position() as usize;
@@ -154,7 +167,34 @@ fn parse_canon_wrapper_content(data: &[u8]) -> Result<CanonExifData> {
         cursor.seek(SeekFrom::Current(content_size))?;
     }
 
-    Err(Error::new(ErrorKind::NotFound, "CNTH atom not found"))
+    // CNTH remains authoritative when both layouts are present.
+    let mut result = CanonExifData::default();
+    let mut parsed = false;
+    for (index, block) in cmt_blocks.into_iter().enumerate() {
+        let Some(block) = block else { continue };
+        let parse_result = (|| -> Result<()> {
+            let (is_le, offset) = tiff_header(block)?;
+            match index {
+                0 => result = parse_tiff_ifd(block)?,
+                1 => parse_exif_ifd(block, offset, is_le, &mut result)?,
+                2 => parse_canon_makernotes(block, offset, block.len(), is_le, &mut result),
+                _ => unreachable!(),
+            }
+            Ok(())
+        })();
+        match parse_result {
+            Ok(()) => parsed = true,
+            Err(e) => log::warn!("Canon: failed to read CMT{}: {e}", index + 1),
+        }
+    }
+    if parsed {
+        result.from_cmt = true;
+        log::debug!("Canon: CMT metadata model={:?} focal_length={:?} datetime={:?} timezone={:?}",
+            result.model, result.focal_length, result.datetime_original, result.offset_time_original);
+        Ok(result)
+    } else {
+        Err(Error::new(ErrorKind::NotFound, "Canon CNTH/CMT metadata not found"))
+    }
 }
 
 /// Parse CNTH atom to find CNDA sub-atom containing JPEG+EXIF.
@@ -207,6 +247,26 @@ fn parse_cnda_jpeg_exif(data: &[u8]) -> Result<CanonExifData> {
 
 /// Parse TIFF IFD structure from EXIF data.
 fn parse_tiff_ifd(tiff_data: &[u8]) -> Result<CanonExifData> {
+    let (is_le, ifd0_offset) = tiff_header(tiff_data)?;
+
+    let mut result = CanonExifData::default();
+    let mut exif_ifd_offset = None;
+    parse_ifd(tiff_data, ifd0_offset, is_le, &mut |tag, _typ, count, value_data, value_offset| {
+        match tag {
+            0x0110 => result.model = Some(read_string(tiff_data, value_data, value_offset, count)),
+            0x8769 if value_data.len() >= 4 => {
+                exif_ifd_offset = Some(read_u32(value_data, 0, is_le) as usize);
+            }
+            _ => {}
+        }
+    })?;
+    if let Some(offset) = exif_ifd_offset {
+        parse_exif_ifd(tiff_data, offset, is_le, &mut result)?;
+    }
+    Ok(result)
+}
+
+fn tiff_header(tiff_data: &[u8]) -> Result<(bool, usize)> {
     if tiff_data.len() < 8 {
         return Err(Error::new(ErrorKind::InvalidData, "TIFF data too short"));
     }
@@ -224,26 +284,15 @@ fn parse_tiff_ifd(tiff_data: &[u8]) -> Result<CanonExifData> {
 
     let ifd0_offset = read_u32(tiff_data, 4, is_le) as usize;
 
-    let mut result = CanonExifData::default();
+    if ifd0_offset < 8 || ifd0_offset.checked_add(2).is_none_or(|end| end > tiff_data.len()) {
+        return Err(Error::new(ErrorKind::InvalidData, "Invalid TIFF IFD offset"));
+    }
+    Ok((is_le, ifd0_offset))
+}
 
-    // Parse IFD0
-    let mut exif_ifd_offset = None;
-    parse_ifd(tiff_data, ifd0_offset, is_le, &mut |tag, _typ, count, value_data, value_offset| {
-        match tag {
-            0x0110 => { // Model
-                result.model = Some(read_string(tiff_data, value_data, value_offset, count));
-            }
-            0x8769 => { // ExifIFD offset
-                exif_ifd_offset = Some(read_u32(tiff_data, value_offset, is_le) as usize);
-            }
-            _ => {}
-        }
-    })?;
-
-    // Parse ExifIFD
+fn parse_exif_ifd(tiff_data: &[u8], offset: usize, is_le: bool, result: &mut CanonExifData) -> Result<()> {
     let mut makernotes_offset = None;
     let mut makernotes_count = 0usize;
-    if let Some(offset) = exif_ifd_offset {
         parse_ifd(tiff_data, offset, is_le, &mut |tag, _typ, count, value_data, value_offset| {
             match tag {
                 0x920A => { // FocalLength (RATIONAL)
@@ -274,19 +323,18 @@ fn parse_tiff_ifd(tiff_data: &[u8]) -> Result<CanonExifData> {
                 _ => {}
             }
         })?;
-    }
 
     // Parse Canon MakerNotes
     if let Some(offset) = makernotes_offset {
-        parse_canon_makernotes(tiff_data, offset, makernotes_count, is_le, &mut result);
+        parse_canon_makernotes(tiff_data, offset, makernotes_count, is_le, result);
     }
 
-    Ok(result)
+    Ok(())
 }
 
 /// Parse a TIFF IFD at the given offset.
 fn parse_ifd(tiff_data: &[u8], offset: usize, is_le: bool, callback: &mut dyn FnMut(u16, u16, usize, &[u8], usize)) -> Result<()> {
-    if offset + 2 > tiff_data.len() {
+    if offset.checked_add(2).is_none_or(|end| end > tiff_data.len()) {
         return Ok(());
     }
 
@@ -311,12 +359,12 @@ fn parse_ifd(tiff_data: &[u8], offset: usize, is_le: bool, callback: &mut dyn Fn
             _ => 1,
         };
 
-        let total_size = cnt * type_size;
+        let Some(total_size) = cnt.checked_mul(type_size) else { continue };
         let (value_data, value_offset) = if total_size <= 4 {
             (&tiff_data[entry_offset + 8..entry_offset + 8 + total_size.min(4)], entry_offset + 8)
         } else {
             let data_offset = read_u32(tiff_data, entry_offset + 8, is_le) as usize;
-            if data_offset + total_size <= tiff_data.len() {
+            if data_offset.checked_add(total_size).is_some_and(|end| end <= tiff_data.len()) {
                 (&tiff_data[data_offset..data_offset + total_size], data_offset)
             } else {
                 continue;
@@ -479,6 +527,92 @@ mod tests {
     fn run(file: &[u8]) -> Result<CanonExifData> {
         let len = file.len();
         parse_canon_exif(&mut Cursor::new(file.to_vec()), len)
+    }
+
+    fn tiff_entries(entries: &[(u16, u16, u32, Vec<u8>)], be: bool) -> Vec<u8> {
+        let u16_bytes = |v: u16| if be { v.to_be_bytes() } else { v.to_le_bytes() };
+        let u32_bytes = |v: u32| if be { v.to_be_bytes() } else { v.to_le_bytes() };
+        let mut bytes = if be { b"MM".to_vec() } else { b"II".to_vec() };
+        bytes.extend(u16_bytes(42));
+        bytes.extend(u32_bytes(8));
+        bytes.extend(u16_bytes(entries.len() as u16));
+        let mut values: Vec<u8> = Vec::new();
+        for (tag, typ, count, value) in entries {
+            bytes.extend(u16_bytes(*tag));
+            bytes.extend(u16_bytes(*typ));
+            bytes.extend(u32_bytes(*count));
+            if value.len() <= 4 {
+                bytes.extend(value);
+                bytes.extend(vec![0; 4 - value.len()]);
+            } else {
+                bytes.extend(u32_bytes((14 + entries.len() * 12 + values.len()) as u32));
+                values.extend(value);
+            }
+        }
+        bytes.extend(u32_bytes(0));
+        bytes.extend(values);
+        bytes
+    }
+
+    #[test]
+    fn cmt_merges_separate_ifds_with_independent_byte_orders() {
+        let cmt1 = tiff_with_model("Canon EOS R3");
+        let cmt2 = tiff_entries(&[
+            (0x920a, 5, 1, [24u32.to_be_bytes(), 1u32.to_be_bytes()].concat()),
+            (0xa434, 2, 23, b"RF24-105mm F4 L IS USM\0".to_vec()),
+            (0x9003, 2, 20, b"2026:09:13 18:33:14\0".to_vec()),
+            (0x9011, 2, 7, b"+09:00\0".to_vec()),
+            (0x9291, 2, 3, b"50\0".to_vec()),
+        ], true);
+        let cmt3 = tiff_entries(&[
+            (0x4049, 3, 4, [8u16, 1, 0, 0].into_iter().flat_map(u16::to_le_bytes).collect()),
+            (0x009a, 4, 1, 13u32.to_le_bytes().to_vec()),
+        ], false);
+        // Physical box order must not change the meaning of each independent IFD.
+        let children = [mp4_box(b"CMT3", &cmt3), mp4_box(b"CMT2", &cmt2), mp4_box(b"CMT1", &cmt1)].concat();
+        let data = parse_canon_wrapper_content(&children).unwrap();
+        assert_eq!(data.model.as_deref(), Some("Canon EOS R3"));
+        assert_eq!(data.focal_length, Some(24.0));
+        assert_eq!(data.lens_model.as_deref(), Some("RF24-105mm F4 L IS USM"));
+        assert_eq!(data.datetime_original.as_deref(), Some("2026:09:13 18:33:14"));
+        assert_eq!(data.offset_time_original.as_deref(), Some("+09:00"));
+        assert_eq!(data.subsec_time_original.as_deref(), Some("50"));
+        assert_eq!(data.movie_crop, Some(true));
+        assert_eq!(data.aspect_ratio, Some(13));
+    }
+
+    #[test]
+    fn malformed_cmt_does_not_discard_other_ifds() {
+        let children = [
+            mp4_box(b"CMT1", &tiff_with_model("Canon EOS R3")),
+            mp4_box(b"CMT2", b"II*\0\xff\xff\xff\xff"),
+        ].concat();
+        let data = parse_canon_wrapper_content(&children).unwrap();
+        assert_eq!(data.model.as_deref(), Some("Canon EOS R3"));
+        assert!(data.focal_length.is_none());
+        assert!(parse_canon_wrapper_content(&mp4_box(b"CMT2", b"bad")).is_err());
+    }
+
+    #[test]
+    fn cmt_exif_without_model_and_invalid_rational_are_safe() {
+        let cmt2 = tiff_entries(&[
+            (0x920a, 5, 1, [24u32.to_le_bytes(), 0u32.to_le_bytes()].concat()),
+            (0x9003, 2, 20, b"2026:09:13 18:33:14\0".to_vec()),
+        ], false);
+        let data = parse_canon_wrapper_content(&mp4_box(b"CMT2", &cmt2)).unwrap();
+        assert!(data.model.is_none());
+        assert!(data.focal_length.is_none());
+        assert_eq!(data.datetime_original.as_deref(), Some("2026:09:13 18:33:14"));
+    }
+
+    #[test]
+    fn cnth_remains_authoritative_over_cmt() {
+        let mut children = mp4_box(b"CMT1", &tiff_with_model("Canon EOS R3"));
+        children.extend(wrapper_children("Canon EOS R5m2", false));
+        let mut uuid = CANON_UUID.to_vec();
+        uuid.extend(children);
+        let data = run(&file_with_moov_children(&mp4_box(b"uuid", &uuid))).unwrap();
+        assert_eq!(data.model.as_deref(), Some("Canon EOS R5m2"));
     }
 
     #[test]
