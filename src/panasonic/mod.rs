@@ -56,10 +56,18 @@ impl Panasonic {
     }
 
     pub fn detect<P: AsRef<std::path::Path>>(buffer: &[u8], _filepath: P, _options: &crate::InputOptions) -> Option<Self> {
+        // The D-LUX Typ 109 stores the same EXIF fields in a LEIC box.
+        let leica = memmem::find_iter(buffer, b"LEIC").any(|pos| {
+            let Some(start) = pos.checked_sub(4) else { return false; };
+            let size = u32::from_be_bytes(buffer[start..pos].try_into().unwrap()) as usize;
+            let Some(end) = start.checked_add(size).filter(|end| size >= 8 && *end <= buffer.len()) else { return false; };
+            extract_leica_exif(&buffer[pos + 4..end]).is_some()
+        });
         // Detect via: "Panasonic" string, "PANA" atom, or "pana" ftyp compatible brand
         if memmem::find(buffer, b"Panasonic").is_some()
             || memmem::find(buffer, b"PANA").is_some()
             || (memmem::find(buffer, b"ftyp").is_some() && memmem::find(buffer, b"pana").is_some())
+            || leica
         {
             return Some(Self {
                 model: None,
@@ -153,12 +161,17 @@ impl Panasonic {
             if content_size < 0 { break; }
             if content_size == 0 { continue; }
 
-            if typ == util::fourcc("PANA") {
+            if typ == util::fourcc("PANA") || typ == util::fourcc("LEIC") {
                 let start = cursor.position() as usize;
                 let end = start + content_size as usize;
                 if end <= data.len() {
                     let pana_data = &data[start..end];
-                    if let Some(result) = extract_exif_from_pana(pana_data) {
+                    let exif = if typ == util::fourcc("LEIC") {
+                        extract_leica_exif(pana_data)
+                    } else {
+                        extract_exif_from_pana(pana_data)
+                    };
+                    if let Some(result) = exif {
                         return Some(result);
                     }
                 }
@@ -330,6 +343,12 @@ impl Panasonic {
 
 // ---- PANA atom content extraction ----
 
+fn extract_leica_exif(data: &[u8]) -> Option<PanasonicExifData> {
+    let exif = extract_exif_from_pana(data)?;
+    // Leave other Leica formats with their existing parser.
+    (exif.model.as_deref() == Some("D-LUX (Typ 109)")).then_some(exif)
+}
+
 /// Extract EXIF data from PANA atom content.
 /// The PANA atom has a proprietary header; we search for TIFF magic within it.
 fn extract_exif_from_pana(pana_data: &[u8]) -> Option<PanasonicExifData> {
@@ -432,6 +451,13 @@ fn parse_tiff_ifd(tiff_data: &[u8]) -> Result<PanasonicExifData> {
                     if value_data.len() > 12 && &value_data[..9] == b"Panasonic" {
                         // MakerNotes data is self-contained; offsets are relative to MakerNotes start
                         makernotes_offset = Some((_value_offset, count));
+                    } else if value_data.starts_with(b"LEICA\0\0\0") {
+                        // Legacy Leica MakerNotes store the same inline OIS tag after an 8-byte header.
+                        parse_ifd_entries(value_data, 8, is_le, &mut |tag, typ, _, value, _| {
+                            if tag == 0x001A && typ == 3 {
+                                result.image_stabilization = read_u16(value, 0, is_le);
+                            }
+                        });
                     }
                 }
                 _ => {}
@@ -502,3 +528,5 @@ fn parse_tiff_ifd(tiff_data: &[u8]) -> Result<PanasonicExifData> {
     Ok(result)
 }
 
+#[cfg(test)]
+mod tests;
