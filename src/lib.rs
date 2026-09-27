@@ -10,6 +10,7 @@ mod runcam;
 mod witmotion;
 mod dji;
 mod xtra;
+mod phone;
 mod phone_apps;
 mod ardupilot;
 mod blackmagic;
@@ -221,6 +222,7 @@ impl_formats! {
     GyroflowGcsv     => gyroflow::GyroflowGcsv,
     GyroflowProtobuf => gyroflow::GyroflowProtobuf,
     BlackBox  => blackbox::BlackBox,
+    Phone => phone::Phone,
     BlackmagicBraw => blackmagic::BlackmagicBraw,
     RedR3d    => red::RedR3d,
     Runcam    => runcam::Runcam,
