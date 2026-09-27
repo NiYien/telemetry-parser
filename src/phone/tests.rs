@@ -2,6 +2,104 @@
 
 use super::*;
 
+// These are metadata fixtures, not claims of physical-device validation.
+const IPHONE_14_18_MODELS: &[(&str, &[f64])] = &[
+    ("iPhone 14", &[26.0, 13.0]),
+    ("iPhone 14 Plus", &[26.0, 13.0]),
+    ("iPhone 14 Pro", &[24.0, 13.0, 77.0]),
+    ("iPhone 14 Pro Max", &[24.0, 13.0, 77.0]),
+    ("iPhone 15", &[26.0, 13.0]),
+    ("iPhone 15 Plus", &[26.0, 13.0]),
+    ("iPhone 15 Pro", &[24.0, 13.0, 77.0]),
+    ("iPhone 15 Pro Max", &[24.0, 13.0, 120.0]),
+    ("iPhone 16", &[26.0, 13.0]),
+    ("iPhone 16 Plus", &[26.0, 13.0]),
+    ("iPhone 16 Pro", &[24.0, 13.0, 120.0]),
+    ("iPhone 16 Pro Max", &[24.0, 13.0, 120.0]),
+    ("iPhone 16e", &[26.0]),
+    ("iPhone 17", &[26.0, 13.0]),
+    ("iPhone 17 Pro", &[24.0, 13.0, 100.0]),
+    ("iPhone 17 Pro Max", &[24.0, 13.0, 100.0]),
+    ("iPhone 17e", &[26.0]),
+    ("iPhone Air", &[26.0]),
+    ("iPhone 18 Pro", &[24.0, 13.0, 100.0]),
+    ("iPhone 18 Pro Max", &[24.0, 13.0, 100.0]),
+];
+
+#[test]
+fn iphone_14_through_18_variants_read_legacy_and_track_level_focal_length() {
+    for &(model, focals) in IPHONE_14_18_MODELS {
+        for &focal in focals {
+            let legacy_model = format!("Apple {model} {focal}mm");
+            let legacy_lens = format!("{model} {focal}mm");
+            let legacy = atom(b"moov", &meta(&[
+                (MODEL, 1, legacy_model.as_bytes()),
+                (SOFTWARE, 1, b"Blackmagic Cam 2.3.000047"),
+                (LENS, 1, legacy_lens.as_bytes()),
+            ], false));
+            let modern_model = format!("Apple {model}");
+            let physical_lens = format!("{model} back camera 4.0mm f/1.8");
+            let equivalent = format!("{focal:.2}mm");
+            let movie = meta(&[(MODEL, 1, modern_model.as_bytes()), (SOFTWARE, 1, b"Blackmagic Cam 3.3"), (LENS, 1, b"")], false);
+            let track = atom(b"trak", &meta(&[
+                (APPLE_LENS, 1, physical_lens.as_bytes()),
+                (EQUIVALENT_FOCAL, 1, equivalent.as_bytes()),
+            ], true));
+            let modern = atom(b"moov", &[movie, track].concat());
+            for (bytes, expected_lens) in [(legacy, legacy_lens.as_str()), (modern, physical_lens.as_str())] {
+                let (phone, map) = parse(&bytes, InputOptions::default());
+                assert_eq!(phone.model.as_deref(), Some(model));
+                assert_eq!(string(&map, GroupId::Lens, TagId::DisplayName).map(String::as_str), Some(expected_lens));
+                assert_eq!(GetWithType::<f32>::get_t(&map[&GroupId::Lens], TagId::FocalLength), Some(&(focal as f32)));
+                assert_eq!(phone.frame_readout_time(), None);
+                assert!(!phone.has_accurate_timestamps());
+            }
+        }
+    }
+}
+
+#[test]
+fn equivalent_tag_wins_and_physical_lens_mm_are_never_used_as_equivalent() {
+    let bytes = recording(&[(EQUIVALENT_FOCAL, 1, b"13.50 mm")], false);
+    let (_, map) = parse(&bytes, InputOptions::default());
+    assert_eq!(GetWithType::<f32>::get_t(&map[&GroupId::Lens], TagId::FocalLength), Some(&13.5));
+    let bytes = atom(b"moov", &meta(&[
+        (MODEL, 1, b"Apple iPhone 18 Pro"),
+        (SOFTWARE, 1, b"Blackmagic Cam 3.3"),
+        (APPLE_LENS, 1, b"iPhone 18 Pro back camera 6.765mm f/1.78"),
+    ], false));
+    let (_, map) = parse(&bytes, InputOptions::default());
+    assert!(!map[&GroupId::Lens].contains_key(&TagId::FocalLength));
+    for value in ["0mm", "-1mm", "NaNmm", "inf", "1e300mm"] {
+        assert_eq!(equivalent_focal(value), None);
+    }
+}
+
+#[test]
+#[ignore = "Set PHONE_CAMERA_DB to validate the authoritative Apple table"]
+fn authoritative_iphone_14_18_table() {
+    let db = camera_db::CameraDatabase::load(&std::env::var("PHONE_CAMERA_DB").unwrap()).unwrap();
+    let table = &db.get_brand("APPLE").unwrap().readout;
+    for &(model, focals) in IPHONE_14_18_MODELS {
+        for &focal in focals {
+            let key = format!("{model} {focal}mm");
+            let row = table.data.get(&key).unwrap_or_else(|| panic!("Missing {key}"));
+            assert_eq!(row.len(), table.columns.len(), "{key}");
+            assert!(row.iter().flatten().all(|v| v.is_finite() && *v < 0.0), "{key}");
+            assert_eq!(lookup_readout(&db, &key, 1920, 1080, 60.0), None);
+        }
+    }
+    for model in ["iPhone 15 Pro", "iPhone 15 Pro Max"] {
+        assert_eq!(lookup_readout(&db, &format!("{model} 24mm"), 3840, 2160, 25.0), Some((5.3, true)));
+        assert_eq!(lookup_readout(&db, &format!("{model} 24mm"), 3840, 2160, 60.0), None);
+    }
+    assert_eq!(lookup_readout(&db, "iPhone 17 Pro 13mm", 3840, 2160, 25.0), Some((6.0, true)));
+    assert_eq!(lookup_readout(&db, "iPhone 17 Pro 13mm", 4224, 2240, 25.0), Some((5.6, true)));
+    assert_eq!(lookup_readout(&db, "iPhone 17 Pro Max 24mm", 4224, 2240, 60.0), Some((2.3, true)));
+    for model in ["iPhone 14 Pro", "iPhone 14 Pro Max", "iPhone 16 Pro", "iPhone 18 Pro", "iPhone 18 Pro Max"] {
+        assert_eq!(lookup_readout(&db, &format!("{model} 24mm"), 3840, 2160, 25.0), None);
+    }
+}
 fn atom(name: &[u8; 4], value: &[u8]) -> Vec<u8> {
     [((value.len() + 8) as u32).to_be_bytes().as_slice(), name, value].concat()
 }
@@ -192,5 +290,19 @@ fn real_iphone_clips() {
         assert_eq!(GetWithType::<f64>::get_t(&map[&GroupId::Lens], TagId::Custom("unit_pixel_focal_length".into())), Some(&(1920.0 / 36.0)));
         assert!(!map[&GroupId::Lens].contains_key(&TagId::FocalLength));
         assert!(!map[&GroupId::Lens].contains_key(&TagId::PixelFocalLength));
+
+        // A front camera may report the same equivalent mm; never borrow the rear row.
+        let db = TestDb::new();
+        let options = InputOptions { camera_db_path: Some(db.0.to_string_lossy().into_owned()), ..Default::default() };
+        let original = std::fs::read(&path).unwrap();
+        let control = Input::from_stream_with_options(&mut Cursor::new(&original), original.len(), &path, |_| {}, Arc::new(AtomicBool::new(false)), options.clone()).unwrap();
+        assert_eq!(control.frame_readout_time(), Some(4.0));
+        let mut front = original;
+        front.extend(meta(&[
+            (APPLE_LENS, 1, b"iPhone 16 Pro Max front camera 2.69mm f/1.9"),
+            (EQUIVALENT_FOCAL, 1, b"24.00mm"),
+        ], true));
+        let parsed = Input::from_stream_with_options(&mut Cursor::new(&front), front.len(), &path, |_| {}, Arc::new(AtomicBool::new(false)), options).unwrap();
+        assert_eq!(parsed.frame_readout_time(), None);
     }
 }

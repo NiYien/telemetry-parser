@@ -7,6 +7,8 @@ use crate::{*, tags_impl::*};
 const MODEL: &str = "com.apple.quicktime.model";
 const SOFTWARE: &str = "com.apple.quicktime.software";
 const LENS: &str = "com.blackmagic-design.camera.lensType";
+const APPLE_LENS: &str = "com.apple.quicktime.camera.lens_model";
+const EQUIVALENT_FOCAL: &str = "com.apple.quicktime.camera.focal_length.35mm_equivalent";
 const READOUT: &str = "com.apple.quicktime.camera.framereadouttimeinmicroseconds";
 
 #[derive(Default)]
@@ -42,9 +44,13 @@ impl Phone {
         }
         let (model, model_focal) = split_focal_length(raw_model);
         self.model = Some(model.into());
-        let lens = metadata.get(LENS).map(String::as_str).unwrap_or(raw_model).trim();
+        let lens = metadata.get(LENS).filter(|v| !v.trim().is_empty()).or_else(|| metadata.get(APPLE_LENS))
+            .map(String::as_str).unwrap_or(raw_model).trim();
         let (lens_model, lens_focal) = split_focal_length(lens);
-        let focal = if lens_model == model { lens_focal.or(model_focal) } else { model_focal };
+        // Apple's explicit equivalent tag may live on the video track. Its lens_model
+        // can contain physical millimetres, which must not become equivalent millimetres.
+        let focal = metadata.get(EQUIVALENT_FOCAL).and_then(|value| equivalent_focal(value))
+            .or_else(|| if lens_model == model { lens_focal.or(model_focal) } else { model_focal });
 
         stream.seek(SeekFrom::Start(0))?;
         let video = util::get_video_metadata(stream, size).ok();
@@ -78,6 +84,8 @@ impl Phone {
 
         let readout = metadata.get(READOUT).and_then(|v| positive_number(v)).map(|v| (v / 1000.0, false))
             .or_else(|| {
+                if lens.to_ascii_lowercase().contains("front") || metadata.get(APPLE_LENS)
+                    .is_some_and(|v| v.to_ascii_lowercase().contains("front")) { return None; }
                 let video = video.as_ref()?;
                 let db = camera_db::CameraDatabase::load(options.camera_db_path.as_deref()?).ok()?;
                 let focal = focal?;
@@ -120,6 +128,12 @@ impl Phone {
 
 fn positive_number(value: &str) -> Option<f64> {
     value.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
+}
+
+fn equivalent_focal(value: &str) -> Option<f64> {
+    let value = value.trim();
+    positive_number(value.strip_suffix("mm").unwrap_or(value))
+        .filter(|v| (*v as f32).is_finite())
 }
 
 fn split_focal_length(value: &str) -> (&str, Option<f64>) {
