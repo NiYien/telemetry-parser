@@ -332,6 +332,21 @@ impl Panasonic {
             }
         }
 
+        // File metadata remains valid even when the camera database has no matching model.
+        if !raw_model.trim().is_empty() {
+            self.model = Some(raw_model.to_owned());
+            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Name, "Camera model", String, |v| v.clone(), raw_model.to_owned(), Vec::new()), options);
+        }
+        if let Some(state) = exif.image_stabilization {
+            let is_on = state != 0 && state != 3;
+            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::ImageStabilizer, "Image stabilization", bool, |v| if *v { "On" } else { "Off" }.into(), is_on, Vec::new()), options);
+        }
+        if fps > 0.0 {
+            let record_fps = exif.record_frame_rate.map(|v| v as f64).unwrap_or(fps);
+            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:.3} fps", v), fps, Vec::new()), options);
+            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::RecordFrameRate, "Record frame rate", f64, |v| format!("{:.3} fps", v), record_fps, Vec::new()), options);
+        }
+
         // Fallback creation date (no JSON db match)
         if let Some(ref dt) = exif.datetime_original {
             util::write_creation_date_tags(map, dt, exif.offset_time_original.as_deref(), exif.subsec_time_original.as_deref().or(Some("500")), options);

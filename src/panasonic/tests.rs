@@ -131,3 +131,49 @@ fn dlux_focal_projection_and_readout_match_lx100() {
         assert_eq!(outputs[0], outputs[1]);
     }
 }
+
+#[test]
+fn file_metadata_survives_missing_or_unmatched_camera_database() {
+    let dir = std::env::temp_dir().join(format!("telemetry-panasonic-file-metadata-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0.join("lumix.json"));
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+    std::fs::write(dir.join("lumix.json"), r#"{"models":{"LX100":{"sw":17.3}}}"#).unwrap();
+    let video = VideoMetadata { width: 3840, height: 2160, fps: 25.0, duration_s: 13.92, rotation: 0 };
+    for database in [None, Some(dir.to_string_lossy().into_owned()), Some(dir.join("missing").to_string_lossy().into_owned())] {
+        let options = InputOptions { camera_db_path: database, ..Default::default() };
+        for (focal, equivalent, state) in [(109, 26, 3), (125, 30, 2), (340, 81, 2)] {
+            let mut exif = parse_tiff_ifd(&tiff("D-LUX (Typ 109)", focal, equivalent)).unwrap();
+            exif.image_stabilization = Some(state);
+            let mut parser = Panasonic::default();
+            let mut map = GroupedTagMap::new();
+            parser.process_map(&mut map, &options, Some(&video), &exif);
+            assert_eq!(parser.model.as_deref(), Some("D-LUX (Typ 109)"));
+            let default = &map[&GroupId::Default];
+            assert_eq!(GetWithType::<String>::get_t(default, TagId::Name).map(String::as_str), Some("D-LUX (Typ 109)"));
+            assert_eq!(GetWithType::<bool>::get_t(default, TagId::ImageStabilizer), Some(&(state == 2)));
+            assert_eq!(GetWithType::<f64>::get_t(default, TagId::FrameRate), Some(&25.0));
+            assert_eq!(GetWithType::<f64>::get_t(default, TagId::RecordFrameRate), Some(&25.0));
+            assert!(!default.contains_key(&TagId::Custom("SensorWidth".into())));
+            let lens = &map[&GroupId::Lens];
+            assert_eq!(GetWithType::<f32>::get_t(lens, TagId::FocalLength), Some(&(focal as f32 / 10.0)));
+            assert!(!lens.contains_key(&TagId::DisplayName));
+            assert!(!lens.contains_key(&TagId::PixelFocalLength));
+            assert!(!lens.contains_key(&TagId::Custom("unit_pixel_focal_length".into())));
+            assert!(parser.frame_readout_time().is_none());
+        }
+    }
+
+    let mut parser = Panasonic::default();
+    let mut map = GroupedTagMap::new();
+    parser.process_map(&mut map, &InputOptions::default(), Some(&video), &PanasonicExifData::default());
+    assert!(parser.model.is_none());
+    assert!(!map[&GroupId::Default].contains_key(&TagId::Name));
+    assert!(!map[&GroupId::Default].contains_key(&TagId::ImageStabilizer));
+}
