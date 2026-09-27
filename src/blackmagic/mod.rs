@@ -184,6 +184,16 @@ impl BlackmagicBraw {
         }
     }
 
+    fn emit_focal_length(map: &mut GroupedTagMap, focal: f32, scale_35mm: Option<f64>, width: f64, options: &crate::InputOptions) {
+        let actual = scale_35mm.map_or(focal, |scale| (focal as f64 / scale) as f32);
+        util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{v:.2} mm"), actual, vec![]), options);
+        if scale_35mm.is_some() && focal.is_finite() && focal > 0.0 {
+            // The recorded value is equivalent millimetres; keep projection accurate through zooms.
+            let pixel_focal = (focal as f64 * width / 36.0) as f32;
+            util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{v:.2}"), pixel_focal, vec![]), options);
+        }
+    }
+
     pub fn parse<T: Read + Seek, F: Fn(f64)>(&mut self, stream: &mut T, size: usize, progress_cb: F, cancel_flag: Arc<AtomicBool>, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
         if !self.is_braw {
             return self.parse_non_braw(stream, size, progress_cb, cancel_flag, options);
@@ -322,6 +332,33 @@ impl BlackmagicBraw {
             }
         }
 
+        // Resolve the source camera once, before emitting any per-frame focal lengths.
+        let source_db = self.original_manufacturer.as_ref().and_then(|_| options.camera_db_path.as_ref())
+            .and_then(|path| crate::camera_db::CameraDatabase::load(path).ok());
+        let source_camera = source_db.as_ref().and_then(|db| {
+            let brand = Self::source_db_brand(self.original_manufacturer.as_deref()?);
+            let (name, data) = db.process_model(&brand, self.model.as_deref().unwrap_or(""), &mut map, &options)?;
+            Some((brand, name.to_string(), data.clone()))
+        });
+        let cap = map.get(&GroupId::Imager)
+            .and_then(|m| m.get_t(TagId::CaptureAreaSize) as Option<&(f32, f32)>).copied();
+        let res_w = cap.map(|v| v.0 as f64).filter(|w| w.is_finite() && *w > 0.0).unwrap_or(0.0);
+        let raw_focal_scale = source_camera.as_ref().and_then(|(brand, _, model)| {
+            if brand != "LUMIX" || res_w <= 0.0 || !model.sw.is_finite() || model.sw <= 0.0 { return None; }
+            let reference_w = model.extra.get("braw_sensor_width_px")?.as_u64()? as f64;
+            if reference_w < res_w || reference_w > 20000.0 { return None; }
+            // Both values are nominal sensor specifications; this is an estimated horizontal scale.
+            let upfl = reference_w / model.sw as f64;
+            if !(50.0..=2000.0).contains(&upfl) { return None; }
+            Some((36.0 * upfl / res_w, upfl))
+        });
+        if let Some((scale, upfl)) = raw_focal_scale {
+            util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{v:.4}"), upfl, vec![]), &options);
+            util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::Custom("scale_35mm".into()), "35mm equivalent scale", f64, |v| format!("{v:.4}"), scale, vec![]), &options);
+            util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{v:.4}"), scale, vec![]), &options);
+            util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::Custom("focal_length_estimated".into()), "Focal length estimated", bool, |v| v.to_string(), true, vec![]), &options);
+        }
+
         let _ = util::get_track_samples(stream, size, mp4parse::TrackType::Video, true, Some(8192), |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
             if size > 0 {
                 progress_cb(file_position as f64 / size as f64 / 3.0);
@@ -338,7 +375,7 @@ impl BlackmagicBraw {
                     let v = v.replace("mm", "");
                     if let Ok(v) = v.parse::<f32>() {
                         if equiv_focal.is_none() && v > 0.0 { equiv_focal = Some(v); }
-                        util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{v:.2} mm"), v, vec![]), &options);
+                        Self::emit_focal_length(&mut map, v, raw_focal_scale.map(|x| x.0), res_w, &options);
                     }
                 }
 
@@ -360,71 +397,36 @@ impl BlackmagicBraw {
             }
         }
 
-        // Video Assist BRAW recorded from a NON-BMD source camera (e.g. Panasonic
-        // S1H over RAW HDMI). The real-BMD camera_db block above is skipped because
-        // `original_manufacturer` is Some(...). Synthesize lens calibration from the
-        // SOURCE camera's camera_db entry (routed by brand, e.g. Panasonic -> LUMIX)
-        // so the downstream auto-lens path can build a camera matrix.
-        //
-        // Why this is safe geometrically: BRAW is the native sensor readout, so the
-        // recorded resolution equals the captured sensor region (no downsampling),
-        // hence `scale_35mm = full_w / captured_w` is well-defined. focal is computed
-        // full-frame referenced (the BRAW focal_length is the 35mm-equivalent, so the
-        // crop cancels: fx = equiv * res_w / 36); only readout depends on the crop.
-        if let Some(mfr) = self.original_manufacturer.clone() {
-            if let Some(db_path) = &options.camera_db_path {
-                if let Ok(db) = crate::camera_db::CameraDatabase::load(db_path) {
-                    let brand = Self::source_db_brand(&mfr);
-                    let raw_name = self.model.as_deref().unwrap_or("").to_string();
-                    if let Some((model_name, model_data)) = db.process_model(&brand, &raw_name, &mut map, &options) {
-                        self.model = Some(model_name.to_string());
-                        let sensor_w = model_data.sw;
+        if let Some((brand, model_name, model_data)) = source_camera {
+            self.model = Some(model_name.clone());
+            let readout_scale = model_data.extra.get("pc").and_then(|v| v.as_u64())
+                .filter(|pc| *pc > 0 && res_w > 0.0).map(|pc| (pc as f64 * 1.5).sqrt() / res_w);
 
-                        // captured width/height = sensor_area_captured (BRAW native readout == output)
-                        let cap = map.get(&GroupId::Imager)
-                            .and_then(|m| m.get_t(TagId::CaptureAreaSize) as Option<&(f32, f32)>)
-                            .copied();
-                        let captured_w = cap.map(|v| v.0 as f64).filter(|w| *w > 0.0);
-                        let res_w = captured_w.map(|w| w.round() as u32).unwrap_or(0);
-                        let res_h = cap.map(|v| v.1.round() as u32).unwrap_or(0);
+            // Older databases and other source cameras retain their existing focal interpretation.
+            if raw_focal_scale.is_none() {
+                if let Some(scale) = readout_scale {
+                    util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{v:.4}"), scale, vec![]), &options);
+                }
+                let upfl_set = map.get(&GroupId::Lens).map_or(false, |m| m.contains_key(&TagId::Custom("unit_pixel_focal_length".into())));
+                if res_w > 0.0 && !upfl_set {
+                    let upfl = res_w / 36.0;
+                    util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{v:.4}"), upfl, vec![]), &options);
+                    let pfl_set = map.get(&GroupId::Lens).map_or(false, |m| m.contains_key(&TagId::PixelFocalLength));
+                    if let Some(fl) = equiv_focal.filter(|f| *f > 5.0 && !pfl_set) {
+                        let px_fl = (fl as f64 * upfl) as f32;
+                        util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{v:.2}"), px_fl, vec![]), &options);
+                    }
+                }
+            }
 
-                        // scale_35mm = full_w / captured_w, full_w = sqrt(pc * 1.5) (3:2 full sensor)
-                        let scale_35mm = match (captured_w, model_data.extra.get("pc").and_then(|v| v.as_u64())) {
-                            (Some(cw), Some(pc)) if pc > 0 && cw > 0.0 => Some((pc as f64 * 1.5).sqrt() / cw),
-                            _ => None,
-                        };
-                        if let Some(scale) = scale_35mm {
-                            util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{:.4}", v), scale, vec![]), &options);
-                        }
-
-                        // focal: full-frame referenced (do NOT multiply by scale_35mm)
-                        let upfl_set = map.get(&GroupId::Lens).map_or(false, |m| m.contains_key(&TagId::Custom("unit_pixel_focal_length".into())));
-                        if res_w > 0 && !upfl_set {
-                            let unit_px_fl = res_w as f64 / 36.0;
-                            util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit_px_fl, vec![]), &options);
-
-                            let pfl_set = map.get(&GroupId::Lens).map_or(false, |m| m.contains_key(&TagId::PixelFocalLength));
-                            if !pfl_set {
-                                if let Some(fl) = equiv_focal.filter(|f| *f > 5.0) {
-                                    let px_fl = fl as f64 * res_w as f64 / 36.0;
-                                    util::insert_tag(&mut map, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{:.2}", v), px_fl as f32, vec![]), &options);
-                                }
-                            }
-                        }
-
-                        // readout: crop-aware via the existing scale_sensor_norm step.
-                        // Treat Some(0.0) as unset: Video Assist BRAW reports
-                        // sensor_line_time=0, so `parse_meta` already set
-                        // frame_readout_time to Some(0.0) above — recompute it from the
-                        // source camera's readout table instead of leaving it at 0.
-                        if self.frame_readout_time.map_or(true, |v| v <= 0.0) {
-                            let tags = std::collections::HashMap::new();
-                            let s35 = scale_35mm.unwrap_or(0.0);
-                            let fps = frame_rate.unwrap_or(0.0);
-                            if let Some(rt) = db.process_readout(&brand, model_name, res_w, res_h, fps, s35, sensor_w, &tags, &mut map, &options) {
-                                self.frame_readout_time = Some(rt);
-                            }
-                        }
+            // Readout timing keeps its existing reference; do not substitute the new focal scale.
+            if self.frame_readout_time.map_or(true, |v| v <= 0.0) {
+                if let Some(db) = source_db.as_ref() {
+                    let tags = std::collections::HashMap::new();
+                    let res_h = cap.map(|v| v.1.round() as u32).unwrap_or(0);
+                    if let Some(rt) = db.process_readout(&brand, &model_name, res_w.round() as u32, res_h,
+                        frame_rate.unwrap_or(0.0), readout_scale.unwrap_or(0.0), model_data.sw, &tags, &mut map, &options) {
+                        self.frame_readout_time = Some(rt);
                     }
                 }
             }
@@ -1028,6 +1030,35 @@ impl BlackmagicBraw {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn braw_equivalent_focal_is_normalized_before_emitting_each_frame() {
+        let options = crate::InputOptions::default();
+        let upfl = 6000.0 / 35.6;
+        let scale = 36.0 * upfl / 4128.0;
+        let mut frames = Vec::new();
+        for equivalent in [50.0_f32, 87.0, 99.0] {
+            let mut map = GroupedTagMap::new();
+            BlackmagicBraw::emit_focal_length(&mut map, equivalent, Some(scale), 4128.0, &options);
+            let lens = &map[&GroupId::Lens];
+            let actual = *GetWithType::<f32>::get_t(lens, TagId::FocalLength).unwrap() as f64;
+            let pixel = *GetWithType::<f32>::get_t(lens, TagId::PixelFocalLength).unwrap() as f64;
+            assert!((actual * upfl - pixel).abs() < 0.002);
+            assert!((pixel - equivalent as f64 * 4128.0 / 36.0).abs() < 0.002);
+            frames.push(pixel);
+        }
+        assert!(frames.windows(2).all(|v| v[0] < v[1]), "zoom must change the per-frame projection");
+    }
+
+    #[test]
+    fn braw_without_a_reference_keeps_recorded_focal_semantics() {
+        let options = crate::InputOptions::default();
+        let mut map = GroupedTagMap::new();
+        BlackmagicBraw::emit_focal_length(&mut map, 87.0, None, 4128.0, &options);
+        let lens = &map[&GroupId::Lens];
+        assert_eq!(GetWithType::<f32>::get_t(lens, TagId::FocalLength), Some(&87.0));
+        assert!(GetWithType::<f32>::get_t(lens, TagId::PixelFocalLength).is_none());
+    }
 
     fn pitch_of(map: &GroupedTagMap) -> Option<(u32, u32)> {
         map.get(&GroupId::Imager)
