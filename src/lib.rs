@@ -30,7 +30,7 @@ mod leica;
 mod panasonic;
 mod fujifilm;
 mod zcam;
-mod kinefinity;
+pub mod kinefinity;
 pub mod camera_db;
 pub mod tiff_ifd;
 

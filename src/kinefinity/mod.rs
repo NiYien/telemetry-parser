@@ -1,88 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Kinefinity camera format parser.
-//! Kinefinity MOV files have empty QuickTime keys/ilst metadata.
-//! Detection is via "KINE" marker in mdat header area.
-//! Core metadata comes from a sidecar file: `{video_name}-slate.txt`
-//! (SLATE.TXT Revision 2.0 format — key-value pairs separated by dots and colon).
+//! Kinefinity MOV metadata and shared sensor geometry.
+//! Modern cameras embed QuickTime metadata; older clips use a matching slate sidecar.
 
-use std::io::*;
-use std::sync::{ Arc, atomic::AtomicBool };
-
-use crate::*;
 use crate::tags_impl::*;
-use memchr::memmem;
+use crate::*;
+use std::io::{Read, Seek};
+use std::sync::{Arc, atomic::AtomicBool};
 
-
-/// Data extracted from the `-slate.txt` sidecar file.
-#[derive(Debug, Default)]
-pub struct SlateData {
-    pub camera_model: Option<String>,
-    pub image_format: Option<String>,  // "FF", "S35", "M43", "S16", "16mm"
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-    pub sensor_fps: Option<f64>,
-    pub focal_length: Option<f64>,     // None if "N/A"
-    pub shot_date: Option<String>,
-    pub shot_tod: Option<String>,
-}
-
-/// View-angle mapping entry: (view_angle_name, sensor_width_mm, max_resolution_w).
-struct ViewAngleEntry {
-    view_angle: &'static str,
-    sensor_w_mm: f64,
-    frame_w: u32,
-}
-
-/// Get view-angle mapping for a given model.
-/// Returns list of (view_angle_name, sensor_width_mm, max_resolution_w) entries.
-fn get_view_angle_map(model: &str) -> &'static [ViewAngleEntry] {
-    match model {
-        "MAVO Edge 8K" => &[
-            ViewAngleEntry { view_angle: "FULL", sensor_w_mm: 36.0, frame_w: 8192 },
-            ViewAngleEntry { view_angle: "S35",  sensor_w_mm: 27.0, frame_w: 6144 },
-        ],
-        "MAVO Edge 6K" => &[
-            ViewAngleEntry { view_angle: "FULL", sensor_w_mm: 36.0, frame_w: 6016 },
-            ViewAngleEntry { view_angle: "S35",  sensor_w_mm: 24.5, frame_w: 4096 },
-        ],
-        "MAVO" => &[
-            ViewAngleEntry { view_angle: "S35",  sensor_w_mm: 24.0, frame_w: 6016 },
-            ViewAngleEntry { view_angle: "M43",  sensor_w_mm: 16.0, frame_w: 4096 },
-            ViewAngleEntry { view_angle: "S16",  sensor_w_mm: 12.0, frame_w: 3072 },
-            ViewAngleEntry { view_angle: "16mm", sensor_w_mm: 8.0,  frame_w: 2048 },
-        ],
-        "MAVO2 S35" => &[
-            ViewAngleEntry { view_angle: "S35",  sensor_w_mm: 24.0, frame_w: 6144 },
-            ViewAngleEntry { view_angle: "M43",  sensor_w_mm: 16.0, frame_w: 4096 },
-            ViewAngleEntry { view_angle: "S16",  sensor_w_mm: 12.0, frame_w: 3072 },
-            ViewAngleEntry { view_angle: "16mm", sensor_w_mm: 8.0,  frame_w: 2048 },
-        ],
-        "MAVO LF" | "MAVO2 LF" => &[
-            ViewAngleEntry { view_angle: "FULL", sensor_w_mm: 36.0, frame_w: 6016 },
-            ViewAngleEntry { view_angle: "S35",  sensor_w_mm: 24.5, frame_w: 4096 },
-        ],
-        "TERRA 4K" => &[
-            ViewAngleEntry { view_angle: "S35",  sensor_w_mm: 19.5, frame_w: 4096 },
-            ViewAngleEntry { view_angle: "M43",  sensor_w_mm: 14.62, frame_w: 3072 },
-            ViewAngleEntry { view_angle: "S16",  sensor_w_mm: 9.7,  frame_w: 2048 },
-        ],
-        _ => &[],
-    }
-}
-
-/// Map the slate "Image Format" field to a canonical view-angle name.
-fn normalize_image_format(fmt: &str) -> &str {
-    match fmt.trim() {
-        "FF"   => "FULL",
-        "S35"  => "S35",
-        "M43"  => "M43",
-        "S16"  => "S16",
-        "16mm" => "16mm",
-        other  => other,
-    }
-}
-
+mod geometry;
+mod metadata;
+pub use geometry::{CameraGeometry, normalize_image_format, resolve_camera_geometry};
+pub use metadata::ClipData as SlateData;
 
 #[derive(Default)]
 pub struct Kinefinity {
@@ -109,379 +38,262 @@ impl Kinefinity {
         v
     }
 
-    pub fn detect<P: AsRef<std::path::Path>>(buffer: &[u8], filepath: P, _options: &crate::InputOptions) -> Option<Self> {
-        // Kinefinity MOV files have "KINE" marker in the first ~64 bytes of the mdat area,
-        // typically after "icpf". Scan the first portion of the buffer for it.
-        let search_len = buffer.len().min(4096);
-        if memmem::find(&buffer[..search_len], b"KINE").is_some() {
-            let path = filepath.as_ref().to_str().unwrap_or_default().to_owned();
-            return Some(Self {
-                model: None,
-                lens: None,
-                frame_readout_time: None,
-                video_path: path,
+    pub fn detect<P: AsRef<std::path::Path>>(
+        buffer: &[u8],
+        filepath: P,
+        options: &InputOptions,
+    ) -> Option<Self> {
+        let path = filepath.as_ref().to_str().unwrap_or_default();
+        let recognized = metadata::detect_prores(buffer) || metadata::detect_metadata(buffer);
+        let recognized = recognized
+            || (!options.dont_look_for_sidecar_files && {
+                let mut data = SlateData::default();
+                metadata::merge_sidecars(path, &mut data);
+                data.camera_model.as_deref().is_some_and(|model| {
+                    let model = model.trim().to_ascii_uppercase();
+                    let model = model.strip_prefix("KINEFINITY ").unwrap_or(&model);
+                    model.starts_with("MAVO") || model == "TERRA 4K" || model == "VISTA"
+                })
             });
-        }
-        None
-    }
-
-    pub fn parse<T: Read + Seek, F: Fn(f64)>(&mut self, stream: &mut T, size: usize, _progress_cb: F, _cancel_flag: Arc<AtomicBool>, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
-        let mut samples = Vec::new();
-        let mut first_map = GroupedTagMap::new();
-
-        // Get video track metadata (resolution, fps)
-        stream.seek(SeekFrom::Start(0))?;
-        let video_md = util::get_video_metadata(stream, size).ok();
-
-        // Look for sidecar file: {stem}-slate.txt
-        let slate = if !options.dont_look_for_sidecar_files {
-            self.find_and_parse_slate()
-        } else {
-            None
-        };
-
-        self.process_map(&mut first_map, &options, video_md.as_ref(), slate.as_ref());
-
-        samples.push(SampleInfo {
-            tag_map: Some(first_map),
+        recognized.then(|| Self {
+            video_path: path.to_owned(),
             ..Default::default()
-        });
-
-        Ok(samples)
+        })
     }
 
-    /// Attempt to find and parse the `-slate.txt` sidecar file.
-    fn find_and_parse_slate(&self) -> Option<SlateData> {
-        if self.video_path.is_empty() { return None; }
-        let slate_path = find_slate_path(&self.video_path)?;
-        parse_slate_file(&slate_path)
-    }
-
-    fn process_map(&mut self, map: &mut GroupedTagMap, options: &crate::InputOptions, video_md: Option<&VideoMetadata>, slate: Option<&SlateData>) {
-        let resolution_w = slate.and_then(|s| s.width)
-            .or_else(|| video_md.map(|v| v.width as u32))
-            .unwrap_or(0);
-        let resolution_h = slate.and_then(|s| s.height)
-            .or_else(|| video_md.map(|v| v.height as u32))
-            .unwrap_or(0);
-        let fps = slate.and_then(|s| s.sensor_fps)
-            .or_else(|| video_md.map(|v| v.fps))
-            .unwrap_or(0.0);
-
-        // Write video track resolution
-        if resolution_w > 0 {
-            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("video_width".into()), "Video output width", u32, |v| format!("{} px", v), resolution_w, Vec::new()), options);
-            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("video_height".into()), "Video output height", u32, |v| format!("{} px", v), resolution_h, Vec::new()), options);
+    pub fn parse<T: Read + Seek, F: Fn(f64)>(
+        &mut self,
+        stream: &mut T,
+        size: usize,
+        progress_cb: F,
+        _cancel_flag: Arc<AtomicBool>,
+        options: InputOptions,
+    ) -> std::io::Result<Vec<SampleInfo>> {
+        let video = util::get_video_metadata(stream, size).ok();
+        let mut data = metadata::read_container(stream, size)?;
+        if !options.dont_look_for_sidecar_files {
+            metadata::merge_sidecars(&self.video_path, &mut data);
         }
+        let mut map = GroupedTagMap::new();
+        self.process_map(&mut map, &options, video.as_ref(), &data);
+        progress_cb(1.0);
+        Ok(vec![SampleInfo {
+            tag_map: Some(map),
+            ..Default::default()
+        }])
+    }
 
-        // Determine camera model from slate or fallback
-        let raw_model_name = slate.and_then(|s| s.camera_model.as_deref()).unwrap_or("");
-        let image_format = slate.and_then(|s| s.image_format.as_deref()).unwrap_or("");
-        let view_angle = if !image_format.is_empty() {
-            Some(normalize_image_format(image_format))
-        } else {
-            None
-        };
+    fn process_map(
+        &mut self,
+        map: &mut GroupedTagMap,
+        options: &InputOptions,
+        video: Option<&VideoMetadata>,
+        data: &SlateData,
+    ) {
+        let width = video
+            .map(|v| v.width as u32)
+            .filter(|v| *v > 0)
+            .or(data.width)
+            .unwrap_or(0);
+        let height = video
+            .map(|v| v.height as u32)
+            .filter(|v| *v > 0)
+            .or(data.height)
+            .unwrap_or(0);
+        let project_fps = video
+            .and_then(|v| metadata::positive(v.fps))
+            .or(data.project_fps)
+            .or(data.sensor_fps);
+        let sensor_fps = data.sensor_fps.or(project_fps);
+        let database = options
+            .camera_db_path
+            .as_deref()
+            .and_then(|path| crate::camera_db::CameraDatabase::load(path).ok());
 
-        // Try JSON database
-        if let Some(db_path) = &options.camera_db_path {
-            if let Ok(db) = crate::camera_db::CameraDatabase::load(db_path) {
-                if let Some((model_name, model_data)) = db.process_model("KINEFINITY", raw_model_name, map, options) {
-                    self.model = Some(model_name.to_string());
-                    let sensor_w = model_data.sw;
-
-                    // Determine crop factor from view-angle mapping
-                    let view_angle_map = get_view_angle_map(model_name);
-                    let va_str = view_angle.unwrap_or("");
-                    let va_entry = view_angle_map.iter().find(|e| e.view_angle == va_str);
-
-                    let crop_factor = if let Some(entry) = va_entry {
-                        // Compute crop from view-angle frame_w vs actual resolution
-                        let max_res_w = entry.frame_w;
-                        let effective_sensor_w = entry.sensor_w_mm;
-
-                        // Oversample detection: if actual resolution < max_resolution_w,
-                        // crop_factor = sensor_w / effective_sensor_w
-                        // Otherwise (actual >= max): crop_factor = sensor_w / effective_sensor_w * (max / actual)
-                        // But for Kinefinity, the crop is simply: sensor_w / effective_sensor_w
-                        // adjusted by the ratio of max_resolution_w to actual resolution when downsampled.
-                        let base_crop = sensor_w as f64 / effective_sensor_w;
-
-                        // If the actual resolution is less than the view-angle native resolution,
-                        // it's a downsample (no extra crop). If greater, it shouldn't happen.
-                        // The crop factor stays the same regardless of output resolution scaling.
-                        if base_crop > 1.001 {
-                            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{:.4}", v), base_crop, Vec::new()), options);
-                        }
-
-                        // Unit pixel focal length: based on the view-angle's sensor width and max resolution
-                        if resolution_w > 0 && max_res_w > 0 {
-                            // If actual resolution equals or is a clean scale of max_res_w,
-                            // the unit_pixel_focal_length should be based on actual resolution
-                            let unit_px_fl = resolution_w as f64 / effective_sensor_w;
-                            util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit_px_fl, Vec::new()), options);
-                        }
-
-                        base_crop
-                    } else {
-                        // No view-angle match, try JSON crop rules as fallback
-                        let tags = std::collections::HashMap::new();
-                        db.process_crop("KINEFINITY", model_name, resolution_w, resolution_h, fps, view_angle, &tags, map, options)
-                    };
-
-                    // Focal length from slate
-                    let fl = slate.and_then(|s| s.focal_length).or(options.user_focal_length);
-                    if let Some(fl_val) = fl {
-                        util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{:.1} mm", v), fl_val as f32, Vec::new()), options);
-
-                        // Pixel focal length
-                        if resolution_w > 0 {
-                            let effective_sensor_w = va_entry.map(|e| e.sensor_w_mm).unwrap_or(sensor_w as f64);
-                            let fx = fl_val / effective_sensor_w * resolution_w as f64;
-                            if fx > 0.0 {
-                                util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{:.2}", v), fx as f32, Vec::new()), options);
-                            }
-                        }
+        self.model = data.camera_model.clone();
+        if let (Some(db), Some(raw_model)) = (&database, &data.camera_model) {
+            if let Some((name, _)) = geometry::find_model(db, raw_model) {
+                db.process_model("KINEFINITY", name, map, options);
+                self.model = Some(name.to_owned());
+            }
+        }
+        if let Some(model) = &self.model {
+            util::insert_tag(
+                map,
+                tag!(parsed GroupId::Default, TagId::Name, "Camera model", String, |v| v.clone(), model.clone(), Vec::new()),
+                options,
+            );
+        }
+        if width > 0 && height > 0 {
+            util::insert_tag(
+                map,
+                tag!(parsed GroupId::Default, TagId::Custom("video_width".into()), "Video output width", u32, |v| format!("{v} px"), width, Vec::new()),
+                options,
+            );
+            util::insert_tag(
+                map,
+                tag!(parsed GroupId::Default, TagId::Custom("video_height".into()), "Video output height", u32, |v| format!("{v} px"), height, Vec::new()),
+                options,
+            );
+        }
+        if let Some(fps) = project_fps {
+            util::insert_tag(
+                map,
+                tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{v:.3} fps"), fps, Vec::new()),
+                options,
+            );
+        }
+        if let Some(fps) = sensor_fps {
+            util::insert_tag(
+                map,
+                tag!(parsed GroupId::Default, TagId::RecordFrameRate, "Record frame rate", f64, |v| format!("{v:.3} fps"), fps, Vec::new()),
+                options,
+            );
+        }
+        let focal = options
+            .user_focal_length
+            .and_then(metadata::positive)
+            .or(data.focal_length)
+            .filter(|v| (*v as f32).is_finite());
+        if let Some(focal) = focal {
+            util::insert_tag(
+                map,
+                tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{v:.1} mm"), focal as f32, Vec::new()),
+                options,
+            );
+        }
+        self.lens = data.lens_name.clone();
+        if let Some(lens) = &self.lens {
+            util::insert_tag(
+                map,
+                tag!(parsed GroupId::Lens, TagId::DisplayName, "Lens", String, |v| v.clone(), lens.clone(), Vec::new()),
+                options,
+            );
+        }
+        let mut additional = serde_json::Map::new();
+        if let Some(format) = &data.image_format {
+            additional.insert("image_format".into(), normalize_image_format(format).into());
+        }
+        if let Some(over) = data.oversampling {
+            additional.insert("oversampling".into(), over.into());
+        }
+        if let Some(fps) = sensor_fps {
+            additional.insert("sensor_fps".into(), fps.into());
+        }
+        if let Some(fps) = project_fps {
+            additional.insert("project_fps".into(), fps.into());
+        }
+        if let Some(firmware) = &data.firmware {
+            additional.insert("camera_firmware".into(), firmware.clone().into());
+        }
+        if let (Some(db), Some(model), Some(fps)) = (&database, &self.model, sensor_fps) {
+            if let Some(geometry) = resolve_camera_geometry(
+                db,
+                model,
+                (width, height),
+                fps,
+                data.image_format.as_deref(),
+                data.oversampling,
+            ) {
+                util::insert_tag(
+                    map,
+                    tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{v:.4}"), geometry.crop_factor, Vec::new()),
+                    options,
+                );
+                util::insert_tag(
+                    map,
+                    tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{v:.4}"), geometry.unit_pixel_focal_length, Vec::new()),
+                    options,
+                );
+                if let Some(focal) = focal {
+                    let pixels = (focal * geometry.unit_pixel_focal_length) as f32;
+                    if pixels.is_finite() && pixels > 0.0 {
+                        util::insert_tag(
+                            map,
+                            tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{v:.2}"), pixels, Vec::new()),
+                            options,
+                        );
                     }
-
-                    // Readout time from database
-                    if self.frame_readout_time.is_none() {
-                        let tags = std::collections::HashMap::new();
-                        let lookup_fps = if fps < 1.0 { 24.0 } else { fps };
-                        if let Some(rt) = db.process_readout("KINEFINITY", model_name, resolution_w, resolution_h, lookup_fps, crop_factor, sensor_w, &tags, map, options) {
-                            self.frame_readout_time = Some(rt);
-                        }
-                    }
-
-                    // Creation date from slate
-                    if let Some(slate) = slate {
-                        if let (Some(date), Some(tod)) = (&slate.shot_date, &slate.shot_tod) {
-                            if let Some(date_str) = normalize_slate_date(date) {
-                                let combined = format!("{} {}", date_str, tod);
-                                util::write_creation_date_tags(map, &combined, None, Some("500"), options);
-                            }
-                        }
-                    }
-
-                    // Frame rates
-                    if fps > 0.0 {
-                        util::insert_tag(map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:.3} fps", v), fps, Vec::new()), options);
-                        util::insert_tag(map, tag!(parsed GroupId::Default, TagId::RecordFrameRate, "Record frame rate", f64, |v| format!("{:.3} fps", v), fps, Vec::new()), options);
-                    }
-
-                    // Image stabilization (Kinefinity has no in-body stabilization)
-                    util::insert_tag(map, tag!(parsed GroupId::Default, TagId::ImageStabilizer, "Image stabilization", bool, |v| if *v { "On" } else { "Off" }.into(), false, Vec::new()), options);
-
-                    return; // JSON path complete
+                }
+                additional.insert("crop_factor".into(), geometry.crop_factor.into());
+                additional.insert("oversampling".into(), geometry.oversampling.into());
+                if let Some(source_size) = geometry.source_size {
+                    additional.insert(
+                        "kinefinity_source_size".into(),
+                        serde_json::json!(source_size),
+                    );
+                }
+                additional.insert("readout_source".into(), geometry.readout_source.into());
+                if let Some(readout) = geometry.readout {
+                    self.frame_readout_time = Some(readout.readout_time_ms);
+                    util::insert_tag(
+                        map,
+                        tag!(parsed GroupId::Imager, TagId::FrameReadoutTime, "Frame readout time", f64, |v| format!("{v:.4} ms"), readout.readout_time_ms, Vec::new()),
+                        options,
+                    );
+                    util::insert_tag(
+                        map,
+                        tag!(parsed GroupId::Imager, TagId::Custom("readout_estimated".into()), "Readout time estimated", bool, |v| v.to_string(), readout.is_estimated, Vec::new()),
+                        options,
+                    );
+                    additional.insert("readout_estimated".into(), readout.is_estimated.into());
                 }
             }
         }
-
-        // Fallback: write basic metadata without database
-        if let Some(slate) = slate {
-            if let Some(ref model) = slate.camera_model {
-                self.model = Some(model.clone());
-            }
-            if let (Some(date), Some(tod)) = (&slate.shot_date, &slate.shot_tod) {
-                if let Some(date_str) = normalize_slate_date(date) {
-                    let combined = format!("{} {}", date_str, tod);
-                    util::write_creation_date_tags(map, &combined, None, Some("500"), options);
+        if let Some(date) = &data.creation_utc {
+            util::write_creation_date_tags(map, date, None, None, options);
+        } else if let (Some(date), Some(tod)) = (&data.shot_date, &data.shot_tod) {
+            if let Some(date) = normalize_slate_date(date) {
+                // A local slate timestamp has no UTC offset. Preserve it without claiming UTC.
+                if chrono::NaiveTime::parse_from_str(tod, "%H:%M:%S").is_ok() {
+                    additional.insert("recorded_local_time".into(), format!("{date} {tod}").into());
                 }
             }
         }
-
-        if fps > 0.0 {
-            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:.3} fps", v), fps, Vec::new()), options);
+        if let Some(timecode) = &data.timecode {
+            // The generic timecode tag enables a filename-to-UTC guess in Gyroflow.
+            // A free-running camera timecode must remain independent of the creation date.
+            additional.insert("recorded_timecode".into(), timecode.clone().into());
         }
+        util::insert_tag(
+            map,
+            tag!(parsed GroupId::Default, TagId::ImageStabilizer, "Image stabilization", bool, |v| if *v { "On" } else { "Off" }.into(), false, Vec::new()),
+            options,
+        );
+        let additional = serde_json::Value::Object(additional);
+        util::insert_tag(
+            map,
+            tag!(parsed GroupId::Default, TagId::Metadata, "Metadata", Json, |v| v.to_string(), additional, Vec::new()),
+            options,
+        );
     }
 }
 
-
-// ---------------------------------------------------------------------------
-// Sidecar slate parsing (used externally from gyroflow-core)
-// ---------------------------------------------------------------------------
-
-/// Parse a Kinefinity `-slate.txt` sidecar file.
-///
-/// The path comes from `find_slate_path`, which goes through the filesystem
-/// abstraction — with host-injected filesystem functions (gyroflow) it is a
-/// `file:///` URL (with percent-encoded non-ASCII segments), standalone it is
-/// a native path. Reading MUST go through `crate::filesystem` too so both
-/// forms open correctly; `std::fs` cannot open URL-form paths.
 pub fn parse_slate_file(path: &str) -> Option<SlateData> {
-    let bytes = match crate::filesystem::read_file(path) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("Kinefinity: failed to read slate sidecar {path}: {e}");
-            return None;
-        }
-    };
-    parse_slate_content(&String::from_utf8_lossy(&bytes))
+    metadata::parse_slate(&metadata::read_text(path)?)
 }
-
-/// Parse the content of a `-slate.txt` sidecar file.
-///
-/// The file format is "SLATE.TXT Revision 2.0" — each line is:
-/// ```text
-/// Key Name.........: Value
-/// ```
-/// The dots are visual padding; the actual delimiter is `": "` (colon-space)
-/// after stripping trailing dots from the key portion.
 pub fn parse_slate_content(content: &str) -> Option<SlateData> {
-    let mut data = SlateData::default();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-
-        // Find the ": " delimiter (dots before colon are part of key padding)
-        let Some(colon_pos) = line.find(": ") else { continue };
-        let key_raw = &line[..colon_pos];
-        let value = line[colon_pos + 2..].trim();
-
-        // Strip trailing dots and whitespace from key
-        let key = key_raw.trim_end_matches('.').trim();
-
-        match key {
-            "Camera Model" => {
-                data.camera_model = Some(value.to_string());
-            }
-            "Image Format" => {
-                data.image_format = Some(value.to_string());
-            }
-            "Width" => {
-                data.width = value.parse::<u32>().ok();
-            }
-            "Height" => {
-                data.height = value.parse::<u32>().ok();
-            }
-            "Sensor FPS" => {
-                data.sensor_fps = value.parse::<f64>().ok();
-            }
-            "Focal Length" => {
-                if value != "N/A" {
-                    // May contain unit, e.g. "35mm" or "35"
-                    let num_str = value.trim_end_matches("mm").trim();
-                    data.focal_length = num_str.parse::<f64>().ok();
-                }
-            }
-            "Shot date" => {
-                data.shot_date = Some(value.to_string());
-            }
-            "Shot TOD" => {
-                data.shot_tod = Some(value.to_string());
-            }
-            _ => {}
-        }
-    }
-
-    // Only return if we got at least the camera model
-    if data.camera_model.is_some() || data.width.is_some() {
-        Some(data)
-    } else {
-        None
-    }
+    metadata::parse_slate(content)
 }
 
-/// Normalize a slate "Shot date" value to "YYYY:MM:DD".
-///
-/// KineOS writes dot-separated dates without zero padding (e.g. "2026.7.14");
-/// slash-separated ("2026/07/14") is accepted too. Month and day are
-/// zero-padded because downstream consumers compare date strings textually.
-/// Returns None for values that don't split into 3 numeric parts (e.g. "N/A").
 pub fn normalize_slate_date(date: &str) -> Option<String> {
-    let parts: Vec<&str> = date.trim().split(['/', '.', ':']).collect();
+    let parts: Vec<_> = date.trim().split(['/', '.', ':']).collect();
     if parts.len() != 3 {
         return None;
     }
-    let year: u32 = parts[0].trim().parse().ok()?;
-    let month: u32 = parts[1].trim().parse().ok()?;
-    let day: u32 = parts[2].trim().parse().ok()?;
-    Some(format!("{year:04}:{month:02}:{day:02}"))
+    let date = chrono::NaiveDate::from_ymd_opt(
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    )?;
+    Some(date.format("%Y:%m:%d").to_string())
 }
 
-/// Find the slate sidecar for a given video path.
-/// Given `/path/to/VIDEO_NAME.mov`, looks for `/path/to/VIDEO_NAME-slate.txt`.
 pub fn find_slate_path(video_path: &str) -> Option<String> {
-    let filename = crate::filesystem::get_filename(video_path);
-    let folder = crate::filesystem::get_folder(video_path);
-
-    // Strip extension from filename
-    let stem = if let Some(pos) = filename.rfind('.') {
-        &filename[..pos]
-    } else {
-        &filename
-    };
-
-    let slate_name = format!("{}-slate.txt", stem);
-
-    // Check if file exists via filesystem abstraction
-    let files = crate::filesystem::list_folder(&folder);
-    for (name, path) in &files {
-        if name.eq_ignore_ascii_case(&slate_name) {
-            return Some(path.clone());
-        }
-    }
-
-    None
+    metadata::sidecar_paths(video_path, "-slate.txt")
+        .into_iter()
+        .next()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Verbatim excerpt of a real MAVO LF slate (CRLF line endings, dotted
-    // date, "N/A" focal length, colons inside values).
-    const MAVO_LF_SLATE: &str = "# SLATE.TXT Revision 2.0\r\n\
-# Please DO NOT edit this file manually!\r\n\
-Clip Name...........: PRJ-0004-081-A1-FBC8\r\n\
-Width...............: 6016\r\n\
-Height..............: 3172\r\n\
-Sensor FPS..........: 48\r\n\
-Project FPS.........: 48\r\n\
-Image Format........: FF\r\n\
-Codec...............: ProRes 422LT\r\n\
-Focal Length........: N/A\r\n\
-KineAudio Gain(dB)..: 30:30\r\n\
-Shot date...........: 2026.7.14\r\n\
-Shot TOD............: 17:05:12\r\n\
-SMPTE first frame...: 17:10:27:23\r\n\
-Camera Model........: MAVO LF\r\n";
-
-    #[test]
-    fn test_parse_slate_content_mavo_lf() {
-        let data = parse_slate_content(MAVO_LF_SLATE).expect("slate should parse");
-        assert_eq!(data.camera_model.as_deref(), Some("MAVO LF"));
-        assert_eq!(data.image_format.as_deref(), Some("FF"));
-        assert_eq!(data.width, Some(6016));
-        assert_eq!(data.height, Some(3172));
-        assert_eq!(data.sensor_fps, Some(48.0));
-        assert_eq!(data.focal_length, None); // "N/A"
-        assert_eq!(data.shot_date.as_deref(), Some("2026.7.14"));
-        assert_eq!(data.shot_tod.as_deref(), Some("17:05:12"));
-    }
-
-    #[test]
-    fn test_parse_slate_content_focal_length_with_unit() {
-        let content = "Camera Model........: MAVO LF\r\nFocal Length........: 35mm\r\n";
-        let data = parse_slate_content(content).expect("slate should parse");
-        assert_eq!(data.focal_length, Some(35.0));
-    }
-
-    #[test]
-    fn test_parse_slate_content_empty_or_garbage() {
-        assert!(parse_slate_content("").is_none());
-        assert!(parse_slate_content("no delimiters here\r\njust text\r\n").is_none());
-    }
-
-    #[test]
-    fn test_normalize_slate_date() {
-        assert_eq!(normalize_slate_date("2026.7.14").as_deref(), Some("2026:07:14"));
-        assert_eq!(normalize_slate_date("2026/07/14").as_deref(), Some("2026:07:14"));
-        assert_eq!(normalize_slate_date("2026:07:14").as_deref(), Some("2026:07:14"));
-        assert_eq!(normalize_slate_date(""), None);
-        assert_eq!(normalize_slate_date("N/A"), None);
-        assert_eq!(normalize_slate_date("2026.7"), None);
-        assert_eq!(normalize_slate_date("2026.7.14.5"), None);
-    }
-}
+mod tests;
