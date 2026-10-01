@@ -518,6 +518,9 @@ impl Canon {
                 if self.is_crm && exif.from_cmt {
                     util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_cmt".into()), "Canon CMT metadata", bool, |v| v.to_string(), true, Vec::new()), options);
                 }
+                if let Some(enabled) = exif.image_stabilizer {
+                    util::insert_tag(map, tag!(parsed GroupId::Default, TagId::ImageStabilizer, "Image stabilization", bool, |v| v.to_string(), enabled, Vec::new()), options);
+                }
                 util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_fine".into()), "Canon Fine mode", bool, |v| v.to_string(), exif.canon_fine, Vec::new()), options);
                 if let Some(movie_crop) = exif.movie_crop {
                     util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_movie_crop".into()), "Canon movie cropping", bool, |v| v.to_string(), movie_crop, Vec::new()), options);
@@ -1963,6 +1966,32 @@ mod tests {
             } else {
                 assert!(record.is_none(), "Existing no-database behavior must be preserved");
             }
+        }
+    }
+
+    #[test]
+    fn image_stabilizer_uses_exif_without_later_cndm_overwrite() {
+        for expected in [Some(false), Some(true), None] {
+            let mut canon = Canon::default();
+            let mut samples: Vec<_> = [0u8, 1, 3].into_iter().map(|raw| {
+                let mut map = GroupedTagMap::new();
+                parse_tags(&[0xe2, 0x1b, 0, 1, raw], &InputOptions::default(), &mut map).unwrap();
+                SampleInfo { tag_map: Some(map), ..Default::default() }
+            }).collect();
+            canon.process_map(&mut samples, &InputOptions::default(), Some(exif::CanonExifData {
+                model: Some("Canon EOS R6 Mark III".into()), image_stabilizer: expected, ..Default::default()
+            }), None, None, None);
+            let mut displayed = None;
+            for (index, sample) in samples.iter().enumerate() {
+                let group = &sample.tag_map.as_ref().unwrap()[&GroupId::Default];
+                let raw = group.get_t(TagId::Custom("OpticalImageStabilizer".into())) as Option<&u8>;
+                assert_eq!(raw, Some(&[0, 1, 3][index]));
+                if let Some(value) = group.get_t(TagId::ImageStabilizer) as Option<&bool> {
+                    assert_eq!(index, 0, "Frame metadata must not replace the EXIF status");
+                    displayed = Some(*value);
+                }
+            }
+            assert_eq!(displayed, expected);
         }
     }
 

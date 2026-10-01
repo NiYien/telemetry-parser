@@ -33,7 +33,8 @@ pub fn get_tag(tag: u16, tag_data: &[u8]) -> TagDescription {
         0xe120 => tag!(Default,   SensorHeight,                                       "Imager Dimension (Effective Height)",     f32,    "{:.2} mm",                      |d| Ok(d.read_f32::<BigEndian>()? as f32), tag_data),
         0xe203 => tag!(Default,   PixelAspectRatio,                                   "Image Sensor Pixel Aspect Ratio",         u32x2,  |v| format!("{}:{}", v.0, v.1),  |d| { let num = d.read_u16::<BigEndian>()? as u32; let den = d.read_u16::<BigEndian>()? as u32; Ok((num, den)) }, tag_data),
         0xe210 => tag!(Default,   TagId::Custom("LookFileName".into()),               "Look File Name",                          String, |v| v.to_string(),               |d| read_utf8(d), tag_data),
-        0xe21b => tag!(Default,   ImageStabilizer,                                    "Optical Image Stabilizer",                bool,   "{}",                            |d| Ok(d.read_u8()? == 0), tag_data),
+        // This CNDM enum is not the EXIF CameraSettings IS enum. Preserve it without guessing a switch state.
+        0xe21b => tag!(Default,   TagId::Custom("OpticalImageStabilizer".into()),       "Optical Image Stabilizer (raw)",          u8,     "{}",                            |d| d.read_u8(), tag_data),
         0xe222 => tag!(Default,   RollingShutterCorrection,                           "RS Distortion Flag",                      bool,   "{}",                            |d| Ok(d.read_u8()? == 1), tag_data),
         0xe224 => tag!(Default,   TagId::Custom("LensStabilizerMode".into()),         "Lens Image Stabilizer Mode",              u8,     "{}",                            |d| d.read_u8(), tag_data),
         0xe225 => tag!(Default,   TagId::Custom("IBISStabilizerMode".into()),         "In-Body Image Stabilizer Mode",           u8,     "{}",                            |d| d.read_u8(), tag_data),

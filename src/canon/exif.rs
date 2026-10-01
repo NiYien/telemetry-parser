@@ -27,6 +27,8 @@ pub struct CanonExifData {
     pub model: Option<String>,
     pub focal_length: Option<f64>,
     pub lens_model: Option<String>,
+    /// MakerNote CameraSettings (0x0001), element 34, using ExifTool's value table.
+    pub image_stabilizer: Option<bool>,
     pub canon_fine: bool,
     /// MakerNote 0x0034: playback and recording frame rates, respectively.
     pub movie_frame_rates: Option<(f64, f64)>,
@@ -389,7 +391,7 @@ fn parse_ifd(tiff_data: &[u8], offset: usize, is_le: bool, callback: &mut dyn Fn
     Ok(())
 }
 
-/// Parse the Canon MakerNotes IFD entries needed for crop-mode resolution.
+/// Parse the Canon MakerNotes IFD entries needed for camera settings.
 fn parse_canon_makernotes(tiff_data: &[u8], offset: usize, _count: usize, is_le: bool, result: &mut CanonExifData) {
     // Canon MakerNotes is a standard IFD structure starting at the offset
     let _ = parse_ifd(tiff_data, offset, is_le, &mut |tag, typ, count, value_data, _value_offset| {
@@ -399,6 +401,17 @@ fn parse_canon_makernotes(tiff_data: &[u8], offset: usize, _count: usize, is_le:
 
 fn parse_canon_makernote_entry(tag: u16, typ: u16, count: usize, value_data: &[u8], is_le: bool, result: &mut CanonExifData) {
     match tag {
+        0x0001 => {
+            // Canon.pm CameraSettings[34]: Off/Off (2), then the enabled IS modes.
+            // Unknown values stay unknown rather than being treated as enabled.
+            if matches!(typ, 3 | 8) && count > 34 && value_data.len() >= 70 {
+                result.image_stabilizer = match read_u16(value_data, 68, is_le) {
+                    0 | 256 => Some(false),
+                    1..=4 | 257..=260 => Some(true),
+                    _ => None,
+                };
+            }
+        }
         0x0034 => {
             // int32u array. Check element[3] & 0x100 for Fine mode.
             if typ == 4 && count >= 4 && value_data.len() >= 16 {
@@ -476,6 +489,40 @@ fn read_u32(data: &[u8], offset: usize, is_le: bool) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_stabilizer_matches_exiftool_camera_settings_values() {
+        for is_le in [true, false] {
+            for typ in [3, 8] {
+                for (raw, expected) in [
+                    (0u16, Some(false)), (256, Some(false)),
+                    (1, Some(true)), (2, Some(true)), (3, Some(true)), (4, Some(true)),
+                    (257, Some(true)), (258, Some(true)), (259, Some(true)), (260, Some(true)),
+                    (5, None), (255, None), (261, None), (u16::MAX, None),
+                ] {
+                    let mut bytes = vec![0; 70];
+                    bytes[68..70].copy_from_slice(&if is_le { raw.to_le_bytes() } else { raw.to_be_bytes() });
+                    let mut data = CanonExifData::default();
+                    parse_canon_makernote_entry(0x0001, typ, 35, &bytes, is_le, &mut data);
+                    assert_eq!(data.image_stabilizer, expected, "raw={raw} typ={typ} is_le={is_le}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn image_stabilizer_rejects_missing_or_incomplete_camera_settings() {
+        for len in 0..70 {
+            let mut data = CanonExifData::default();
+            parse_canon_makernote_entry(0x0001, 3, 35, &vec![0; len], true, &mut data);
+            assert_eq!(data.image_stabilizer, None, "len={len}");
+        }
+        for (tag, typ, count) in [(0x0002, 3, 35), (0x0001, 4, 35), (0x0001, 3, 34)] {
+            let mut data = CanonExifData::default();
+            parse_canon_makernote_entry(tag, typ, count, &[0; 70], true, &mut data);
+            assert_eq!(data.image_stabilizer, None);
+        }
+    }
 
     // Complete MakerNote 0x0034 from the original C70 MVI_2627.MP4.
     const C70_MOVIE_INFO: [u8; 192] = hex_literal::hex!("
