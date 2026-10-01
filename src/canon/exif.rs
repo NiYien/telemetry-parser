@@ -28,6 +28,8 @@ pub struct CanonExifData {
     pub focal_length: Option<f64>,
     pub lens_model: Option<String>,
     pub canon_fine: bool,
+    /// MakerNote 0x0034: playback and recording frame rates, respectively.
+    pub movie_frame_rates: Option<(f64, f64)>,
     /// MakerNote 0x4049: the dedicated movie-cropping setting.
     /// `None` means the tag was absent or carried an unknown value.
     pub movie_crop: Option<bool>,
@@ -38,6 +40,16 @@ pub struct CanonExifData {
     pub datetime_original: Option<String>,
     pub offset_time_original: Option<String>,
     pub subsec_time_original: Option<String>,
+}
+
+impl CanonExifData {
+    pub fn slow_motion_record_frame_rate(&self, container_fps: f64) -> Option<f64> {
+        let (playback, recording) = self.movie_frame_rates?;
+        // Do not apply stale camera metadata after a clip has been retimed.
+        (container_fps.is_finite() && container_fps > 0.0
+            && (playback - container_fps).abs() < 0.01 && recording > playback)
+            .then_some(recording)
+    }
 }
 
 /// Find the Canon metadata wrapper inside an MP4/MOV file and extract EXIF data from CNTH/CNDA.
@@ -395,6 +407,21 @@ fn parse_canon_makernote_entry(tag: u16, typ: u16, count: usize, value_data: &[u
                     result.canon_fine = true;
                 }
             }
+            // The 192-byte layout with word 1 = 6 stores two rationals at indices 17..20.
+            // Only accept the complete layout verified in original C70 clips.
+            if typ == 4 && count == 48 && value_data.len() == 192
+                && read_u32(value_data, 0, is_le) == 192
+                && read_u32(value_data, 4, is_le) == 6
+            {
+                let rate = |offset| {
+                    let num = read_u32(value_data, offset, is_le);
+                    let den = read_u32(value_data, offset + 4, is_le);
+                    if num == 0 || den == 0 { return None; }
+                    let fps = num as f64 / den as f64;
+                    (fps <= 1000.0).then_some(fps)
+                };
+                result.movie_frame_rates = rate(68).zip(rate(76));
+            }
         }
         0x0098 => {
             // CropInfo int16u[4]: left, right, top, bottom margins.
@@ -449,6 +476,76 @@ fn read_u32(data: &[u8], offset: usize, is_le: bool) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Complete MakerNote 0x0034 from the original C70 MVI_2627.MP4.
+    const C70_MOVIE_INFO: [u8; 192] = hex_literal::hex!("
+        c00000000600000000000001800000090000000a000000030000000400000005
+        0000000000000000000000000000000000000000000000000000000000000000
+        00000000a8610000e8030000a0860100e8030000b00100000000000000000000
+        00000000cdc8476a0000000000000000207f3b0c0c0000000c00000001000000
+        804300000070170080bb000002000000010000003163766800e1f505ffffffff
+        0000000000000000000000000000000000000000000000000000020000000000
+    ");
+
+    #[test]
+    fn c70_movie_frame_rates_from_original_makernote() {
+        for is_le in [true, false] {
+            let mut bytes = C70_MOVIE_INFO;
+            if !is_le {
+                for word in bytes.chunks_exact_mut(4) { word.reverse(); }
+            }
+            let mut data = CanonExifData::default();
+            parse_canon_makernote_entry(0x0034, 4, 48, &bytes, is_le, &mut data);
+            assert_eq!(data.movie_frame_rates, Some((25.0, 100.0)));
+            assert_eq!(data.slow_motion_record_frame_rate(25.0), Some(100.0));
+        }
+    }
+
+    #[test]
+    fn movie_frame_rates_reject_unknown_or_incomplete_layouts() {
+        for len in 0..192 {
+            let mut data = CanonExifData::default();
+            parse_canon_makernote_entry(0x0034, 4, 48, &C70_MOVIE_INFO[..len], true, &mut data);
+            assert!(data.movie_frame_rates.is_none(), "length={len}");
+        }
+        for (tag, typ, count) in [(0x0033, 4, 48), (0x0034, 3, 48), (0x0034, 4, 47)] {
+            let mut data = CanonExifData::default();
+            parse_canon_makernote_entry(tag, typ, count, &C70_MOVIE_INFO, true, &mut data);
+            assert!(data.movie_frame_rates.is_none());
+        }
+        for (offset, value) in [(0, 188u32), (4, 7), (68, 0), (72, 0), (76, 0), (80, 0), (76, u32::MAX)] {
+            let mut bytes = C70_MOVIE_INFO;
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            let mut data = CanonExifData::default();
+            parse_canon_makernote_entry(0x0034, 4, 48, &bytes, true, &mut data);
+            assert!(data.movie_frame_rates.is_none(), "offset={offset}, value={value}");
+        }
+    }
+
+    #[test]
+    fn slow_motion_requires_recorded_rates_and_matching_container() {
+        assert!(CanonExifData::default().slow_motion_record_frame_rate(25.0).is_none());
+        let mut data = CanonExifData { movie_frame_rates: Some((25.0, 100.0)), ..Default::default() };
+        for fps in [0.0, -25.0, f64::NAN, f64::INFINITY, 24.0, 50.0, 100.0] {
+            assert!(data.slow_motion_record_frame_rate(fps).is_none());
+        }
+        for rates in [(25.0, 25.0), (25.0, 12.5)] {
+            data.movie_frame_rates = Some(rates);
+            assert!(data.slow_motion_record_frame_rate(25.0).is_none());
+        }
+        data.movie_frame_rates = Some((29.97, 119.88));
+        assert_eq!(data.slow_motion_record_frame_rate(30000.0 / 1001.0), Some(119.88));
+    }
+
+    #[test]
+    fn movie_frame_rate_validation_preserves_fine_mode() {
+        let mut bytes = C70_MOVIE_INFO;
+        bytes[12..16].copy_from_slice(&0x100u32.to_le_bytes());
+        let mut data = CanonExifData::default();
+        parse_canon_makernote_entry(0x0034, 4, 4, &bytes[..16], true, &mut data);
+        assert!(data.canon_fine);
+        assert!(data.movie_frame_rates.is_none());
+    }
 
     /// ISOBMFF box: BE u32 size (incl. header) + 4CC type + content.
     fn mp4_box(typ: &[u8; 4], content: &[u8]) -> Vec<u8> {

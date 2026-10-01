@@ -584,6 +584,13 @@ impl Canon {
         let resolution_w_video = video_md.map(|v| v.width as u32).unwrap_or(0);
         let resolution_h_video = video_md.map(|v| v.height as u32).unwrap_or(0);
         let fps = video_md.map(|v| v.fps).unwrap_or(0.0);
+        let record_fps = exif_data.as_ref().and_then(|exif| exif.slow_motion_record_frame_rate(fps));
+        if let (Some(record_fps), Some(sample)) = (record_fps, samples.first_mut()) {
+            // Camera-recorded slow motion also works without a camera database.
+            let map = sample.tag_map.get_or_insert_with(GroupedTagMap::new);
+            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:.3} fps", v), fps, Vec::new()), options);
+            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::RecordFrameRate, "Record frame rate", f64, |v| format!("{:.3} fps", v), record_fps, Vec::new()), options);
+        }
         let canon_fine = exif_data.as_ref().map_or(false, |e| e.canon_fine);
         let canon_movie_crop = exif_data.as_ref().and_then(|e| e.movie_crop);
         let canon_aspect_ratio = exif_data.as_ref().and_then(|e| e.aspect_ratio);
@@ -647,7 +654,7 @@ impl Canon {
                                     matched_name,
                                     resolution_w_video,
                                     resolution_h_video,
-                                    fps,
+                                    record_fps.unwrap_or(fps),
                                     view_angle,
                                     &tags,
                                 );
@@ -684,7 +691,7 @@ impl Canon {
                                             _ => (resolution_w_video, resolution_h_video),
                                         }
                                     };
-                                    if let Some(rt) = db.process_readout("CANON", matched_name, readout_w, readout_h, fps, 0.0, sensor_w, &tags, map, options) {
+                                    if let Some(rt) = db.process_readout("CANON", matched_name, readout_w, readout_h, record_fps.unwrap_or(fps), 0.0, sensor_w, &tags, map, options) {
                                         self.frame_readout_time = Some(rt);
                                     }
                                 }
@@ -807,7 +814,7 @@ impl Canon {
                             // Frame rates
                             if fps > 0.0 {
                                 util::insert_tag(map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:.3} fps", v), fps, Vec::new()), options);
-                                util::insert_tag(map, tag!(parsed GroupId::Default, TagId::RecordFrameRate, "Record frame rate", f64, |v| format!("{:.3} fps", v), fps, Vec::new()), options);
+                                util::insert_tag(map, tag!(parsed GroupId::Default, TagId::RecordFrameRate, "Record frame rate", f64, |v| format!("{:.3} fps", v), record_fps.unwrap_or(fps), Vec::new()), options);
                             }
 
                             // Image stabilization (default false; CNDM models output per-frame from 0xe21b)
@@ -1915,6 +1922,60 @@ mod tests {
     fn test_detect_neither_returns_none() {
         let buffer = b"....ftypmp42....NIKON Z 8....";
         assert!(Canon::detect(&buffer[..], "test.mp4", &crate::InputOptions::default()).is_none());
+    }
+
+    #[test]
+    fn slow_motion_tags_require_matching_exif_and_work_without_database() {
+        let video = VideoMetadata { fps: 25.0, width: 3840, height: 2160, duration_s: 17.28, rotation: 0 };
+        for rates in [None, Some((25.0, 25.0)), Some((24.0, 100.0)), Some((25.0, 100.0))] {
+            let mut canon = Canon::default();
+            let mut samples = Vec::new();
+            canon.process_map(&mut samples, &InputOptions::default(), Some(exif::CanonExifData {
+                model: Some("Canon EOS C70".into()), movie_frame_rates: rates, ..Default::default()
+            }), Some(&video), None, None);
+            let map = samples[0].tag_map.as_ref().unwrap();
+            let record = map.get(&GroupId::Default).and_then(|group| group.get_t(TagId::RecordFrameRate) as Option<&f64>);
+            if rates == Some((25.0, 100.0)) {
+                assert_eq!(record, Some(&100.0));
+                assert_eq!(map[&GroupId::Default].get_t(TagId::FrameRate) as Option<&f64>, Some(&25.0));
+            } else {
+                assert!(record.is_none(), "Existing no-database behavior must be preserved");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Set CANON_SLOWMO_SAMPLES_DIR and CANON_SLOWMO_CAMERA_DB for original C70 clips"]
+    fn c70_slow_motion_original_clips() {
+        let dir = std::path::PathBuf::from(std::env::var("CANON_SLOWMO_SAMPLES_DIR").unwrap());
+        let db = std::env::var("CANON_SLOWMO_CAMERA_DB").unwrap();
+        for name in ["MVI_2627.MP4", "MVI_2629.MP4", "MVI_2630.MP4"] {
+            let path = dir.join(name);
+            let original = std::fs::read(&path).unwrap();
+            for db_path in [None, Some(db.clone())] {
+                let options = InputOptions { camera_db_path: db_path, ..Default::default() };
+                for has_recording_rate in [true, false] {
+                    let mut bytes = original.clone();
+                    if !has_recording_rate {
+                        // Clear only the recording numerator in an in-memory control.
+                        assert_eq!(&bytes[0xbc6..0xbce], &[192, 0, 0, 0, 6, 0, 0, 0]);
+                        bytes[0xbc6 + 76..0xbc6 + 80].fill(0);
+                    }
+                    let input = Input::from_stream_with_options(&mut Cursor::new(&bytes), bytes.len(), &path,
+                        |_| {}, Arc::new(AtomicBool::new(false)), options.clone()).unwrap();
+                    assert_eq!(input.camera_type(), "Canon");
+                    let map = input.samples.as_ref().unwrap()[0].tag_map.as_ref().unwrap();
+                    let record = map.get(&GroupId::Default).and_then(|g| g.get_t(TagId::RecordFrameRate) as Option<&f64>);
+                    if has_recording_rate {
+                        assert_eq!(record, Some(&100.0), "{name}");
+                        assert_eq!(map[&GroupId::Default].get_t(TagId::FrameRate) as Option<&f64>, Some(&25.0));
+                    } else {
+                        assert!(record.is_none() || record == Some(&25.0), "{name}");
+                    }
+                    println!("{name}: database={} recorded_rate_present={has_recording_rate} record_fps={record:?}", options.camera_db_path.is_some());
+                }
+            }
+        }
     }
 
     // ── APS-C-only lens implies crop on a full-frame body ──
