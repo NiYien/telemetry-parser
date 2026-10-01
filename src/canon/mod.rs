@@ -66,6 +66,12 @@ fn cndm_effective_geometry(map: &GroupedTagMap) -> Option<(f64, f64)> {
     }
 }
 
+fn has_cndm_pixel_focal_length(map: &GroupedTagMap) -> bool {
+    map.get(&GroupId::Lens)
+        .and_then(|lens| lens.get_t(TagId::PixelFocalLength) as Option<&Vec<f32>>)
+        .is_some_and(|v| v.len() == 2 && v.iter().all(|x| x.is_finite() && *x > 0.0))
+}
+
 fn cndm_crop_projection(sensor_width_mm: f32, output_width: u32, geometry: (f64, f64)) -> Option<(f64, f64)> {
     let effective_width_mm = geometry.0;
     if sensor_width_mm > 0.0 && output_width > 0 && effective_width_mm > 0.0 {
@@ -657,7 +663,23 @@ impl Canon {
                                     record_fps.unwrap_or(fps),
                                     view_angle,
                                     &tags,
-                                );
+                                ).or_else(|| {
+                                    // Only fill an unmatched full-frame rule when the file explicitly
+                                    // disables movie cropping. Keep sensor, lens, and mode crops first.
+                                    if cndm_projection.is_none() && mxf_crop.is_none()
+                                        && !has_cndm_pixel_focal_length(map)
+                                        && canon_aspect_ratio.is_none()
+                                        && canon_movie_crop == Some(false)
+                                        && sensor_w >= 35.0 && !lens_implies_crop
+                                    {
+                                        db.match_crop(
+                                            "CANON", matched_name, resolution_w_video, resolution_h_video,
+                                            record_fps.unwrap_or(fps), Some("FULL"), &tags,
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                });
                                 let aspect_crop = canon_aspect_crop_factor(canon_aspect_ratio);
                                 let (effective_crop, crop_source) = if let Some((crop, _)) = cndm_projection {
                                     (crop, "cndm_geometry")
@@ -736,7 +758,7 @@ impl Canon {
                                 // Preserve precise CNDM geometry as the source of truth. Gyroflow
                                 // derives pixel focal length from focal length, pixel pitch, and
                                 // capture area when this synthetic tag is absent.
-                                if cndm_projection.is_none() {
+                                if cndm_projection.is_none() && !has_cndm_pixel_focal_length(map) {
                                     if let Some(upfl) = unit_px_fl {
                                         let fl_from_file = map.get(&GroupId::Lens)
                                             .and_then(|m| m.get_t(TagId::FocalLength) as Option<&f32>)
@@ -777,7 +799,7 @@ impl Canon {
                                 }
 
                                 // Let Gyroflow derive PixelFocalLength from precise CNDM geometry.
-                                if !has_cndm_geometry {
+                                if !has_cndm_geometry && !has_cndm_pixel_focal_length(smap) {
                                     if let Some(upfl) = unit_px_fl {
                                         let fl_from_file = smap.get(&GroupId::Lens)
                                             .and_then(|m| m.get_t(TagId::FocalLength) as Option<&f32>)
@@ -2050,3 +2072,6 @@ mod tests {
         assert!((56.0 * upfl - 8825.59).abs() < 0.1);
     }
 }
+
+#[cfg(test)]
+mod lens_fallback_tests;
