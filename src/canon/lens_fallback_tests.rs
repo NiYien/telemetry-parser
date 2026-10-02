@@ -14,7 +14,7 @@ fn parse_maps(model: &str, exif: exif::CanonExifData, maps: Vec<GroupedTagMap>, 
         ..Default::default()
     }).collect();
     let video = VideoMetadata { width, height: 2160, fps, ..Default::default() };
-    canon.process_map(&mut samples, &options, Some(exif), Some(&video), None, None);
+    canon.process_map(&mut samples, &options, Some(exif), Some(&video), None, None, None);
     samples
 }
 

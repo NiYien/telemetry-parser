@@ -9,6 +9,7 @@ use crate::tags_impl::*;
 use crate::*;
 use memchr::memmem;
 mod cndm_tags;
+mod mxf_time;
 use cndm_tags::get_tag;
 pub mod exif;
 
@@ -187,14 +188,16 @@ impl Canon {
         let is_mxf = header == [0x06, 0x0E, 0x2B, 0x34];
         let mut mxf_creation_time: Option<String> = None;
         let mut mxf_creation_subsec: Option<String> = None;
+        let mut mxf_creation_timezone: Option<String> = None;
         let mut mxf_video_md: Option<util::VideoMetadata> = None;
         let mut samples = if is_mxf { // MXF header
             // Canon MXF: use single-pass fast path (Header Metadata + Index Table sparse seek)
             // instead of legacy 3-pass scan. Skips ST 436 ancillary entirely (Canon MXF has
             // no IMU data). HDD wall time on 39 GB R5 C MXF: 200s -> ~65-80s.
-            let (s, ct, cs, vmd) = parse_canon_mxf_fast(stream, size, &options, &progress_cb, cancel_flag.clone())?;
+            let (s, ct, cs, tz, vmd) = parse_canon_mxf_fast(stream, size, &options, &progress_cb, cancel_flag.clone())?;
             mxf_creation_time = ct;
             mxf_creation_subsec = cs;
+            mxf_creation_timezone = tz;
             mxf_video_md = vmd;
             s
         } else {
@@ -417,12 +420,12 @@ impl Canon {
         stream.seek(SeekFrom::Start(0))?;
         let exif_data = if is_mxf { Err(Error::new(ErrorKind::NotFound, "MXF has no UUID EXIF")) } else { exif::parse_canon_exif(stream, size) };
 
-        self.process_map(&mut samples, &options, exif_data.ok(), video_md.as_ref(), mxf_creation_time.as_deref(), mxf_creation_subsec.as_deref());
+        self.process_map(&mut samples, &options, exif_data.ok(), video_md.as_ref(), mxf_creation_time.as_deref(), mxf_creation_subsec.as_deref(), mxf_creation_timezone.as_deref());
 
         Ok(samples)
     }
 
-    fn process_map(&mut self, samples: &mut Vec<SampleInfo>, options: &crate::InputOptions, exif_data: Option<exif::CanonExifData>, video_md: Option<&VideoMetadata>, mxf_creation_time: Option<&str>, mxf_creation_subsec: Option<&str>) {
+    fn process_map(&mut self, samples: &mut Vec<SampleInfo>, options: &crate::InputOptions, exif_data: Option<exif::CanonExifData>, video_md: Option<&VideoMetadata>, mxf_creation_time: Option<&str>, mxf_creation_subsec: Option<&str>, mxf_creation_timezone: Option<&str>) {
         let imu_orientation = "yxZ";
         for sample in samples.iter_mut() {
             if let Some(ref mut map) = sample.tag_map {
@@ -825,7 +828,7 @@ impl Canon {
                             if let Some((ref date_str, ref tz_str, ref cndm_subsec)) = cndm_creation_date {
                                 util::write_creation_date_tags(map, date_str, tz_str.as_deref(), cndm_subsec.as_deref(), options);
                             } else if let Some(mxf_time) = mxf_creation_time {
-                                util::write_creation_date_tags(map, mxf_time, None, mxf_creation_subsec.or(Some("500")), options);
+                                util::write_creation_date_tags(map, mxf_time, mxf_creation_timezone, mxf_creation_subsec.or(Some("500")), options);
                             } else if let Some(ref exif) = exif_data {
                                 if let Some(ref dt) = exif.datetime_original {
                                     util::write_creation_date_tags(map, dt, exif.offset_time_original.as_deref(), exif.subsec_time_original.as_deref().or(Some("500")), options);
@@ -860,7 +863,7 @@ impl Canon {
             if let Some((ref date_str, ref tz_str, ref cndm_subsec)) = cndm_creation_date {
                 util::write_creation_date_tags(map, date_str, tz_str.as_deref(), cndm_subsec.as_deref(), options);
             } else if let Some(mxf_time) = mxf_creation_time {
-                util::write_creation_date_tags(map, mxf_time, None, mxf_creation_subsec.or(Some("500")), options);
+                util::write_creation_date_tags(map, mxf_time, mxf_creation_timezone, mxf_creation_subsec.or(Some("500")), options);
             } else if let Some(ref exif) = exif_data {
                 if let Some(ref dt) = exif.datetime_original {
                     // Use explicit OffsetTimeOriginal if available, otherwise infer from mvhd UTC
@@ -1490,9 +1493,10 @@ fn mxf_partial_result(
     model_name: Option<String>,
     creation_time: Option<String>,
     creation_subsec: Option<String>,
+    timezone: Option<String>,
     video_md: Option<util::VideoMetadata>,
     options: &crate::InputOptions,
-) -> (Vec<SampleInfo>, Option<String>, Option<String>, Option<util::VideoMetadata>) {
+) -> (Vec<SampleInfo>, Option<String>, Option<String>, Option<String>, Option<util::VideoMetadata>) {
     let mut map = GroupedTagMap::new();
     if let Some(ref m) = model_name {
         let model_clean = m.strip_prefix("Canon ").unwrap_or(m).to_string();
@@ -1503,18 +1507,18 @@ fn mxf_partial_result(
         );
     }
     let samples = vec![SampleInfo { tag_map: Some(map), ..Default::default() }];
-    (samples, creation_time, creation_subsec, video_md)
+    (samples, creation_time, creation_subsec, timezone, video_md)
 }
 
 // Single-pass Canon MXF parse using Index Table sparse seeks.
-// Returns: (samples, creation_time, creation_subsec, video_metadata)
+// Returns: (samples, creation_time, creation_subsec, creation_timezone, video_metadata)
 pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
     stream: &mut T,
     size: usize,
     options: &crate::InputOptions,
     progress_cb: &F,
     cancel_flag: Arc<AtomicBool>,
-) -> Result<(Vec<SampleInfo>, Option<String>, Option<String>, Option<util::VideoMetadata>)> {
+) -> Result<(Vec<SampleInfo>, Option<String>, Option<String>, Option<String>, Option<util::VideoMetadata>)> {
     // Step 1: probe the Header Partition Pack, then read a front window sized from what it
     // declares. A fixed window breaks on long clips: Canon reserves an index region scaled to
     // the clip length and rounds it up to a power-of-two boundary, so essence can start past
@@ -1537,6 +1541,7 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
     // Step 2: walk KLVs
     let mut creation_time: Option<String> = None;
     let mut creation_subsec: Option<String> = None;
+    let mut system_metadata_pack: Option<Vec<u8>> = None;
     let mut model_name: Option<String> = None;
     let mut video_md: Option<util::VideoMetadata> = None;
     let mut frame_rate: f64 = 25.0;
@@ -1583,6 +1588,12 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
                 creation_subsec = ss;
             }
         }
+        // The first System Metadata Pack carries the recording date and ST 309 timezone.
+        else if key == &[0x06, 0x0E, 0x2B, 0x34, 0x02, 0x05, 0x01, 0x01, 0x0D, 0x01, 0x03, 0x01, 0x04, 0x01, 0x01, 0x00] {
+            if system_metadata_pack.is_none() {
+                system_metadata_pack = Some(if val.len() == 57 { val.to_vec() } else { Vec::new() });
+            }
+        }
         // Identification Set
         else if key == &[0x06, 0x0E, 0x2B, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0D, 0x01, 0x01, 0x01, 0x01, 0x01, 0x30, 0x00] {
             if let Some(name) = parse_identification_app_name(val) {
@@ -1612,6 +1623,14 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
         i = val_end;
     }
 
+    let mxf_timezone = system_metadata_pack.as_deref()
+        .and_then(|pack| mxf_time::creation_timezone(pack, creation_time.as_deref(), frame_rate));
+    if let Some(ref timezone) = mxf_timezone {
+        log::info!("Canon MXF time: source=system_metadata_pack local={:?} timezone={} subsec={:?}", creation_time, timezone, creation_subsec);
+    } else if system_metadata_pack.is_some() {
+        log::debug!("Canon MXF time: no valid matching date/timezone in first System Metadata Pack; retaining Preface fallback");
+    }
+
     // Patch up duration_s if Picture Descriptor lacked its own duration tag
     if let Some(ref mut vmd) = video_md {
         if vmd.duration_s == 0.0 && max_duration > 0 && frame_rate > 0.0 {
@@ -1627,13 +1646,13 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
         Some(v) => v,
         None => {
             log::warn!("Canon MXF fast path: essence_start not found in first {} bytes, returning partial metadata", front_size);
-            return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, video_md, options));
+            return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, mxf_timezone, video_md, options));
         }
     };
 
     if eu_offsets.len() < 2 {
         log::warn!("Canon MXF fast path: Index Table has {} entries, need at least 2, returning partial metadata", eu_offsets.len());
-        return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, video_md, options));
+        return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, mxf_timezone, video_md, options));
     }
 
     // Step 3: locate Canvas in EU[0]
@@ -1641,7 +1660,7 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
     let eu0_size = CANON_MXF_FAST_EU0_BYTES.min(eu0_avail);
     if eu0_size == 0 {
         log::warn!("Canon MXF fast path: no essence bytes available, returning partial metadata");
-        return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, video_md, options));
+        return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, mxf_timezone, video_md, options));
     }
     let mut eu0 = vec![0u8; eu0_size];
     stream.seek(SeekFrom::Start(essence_start))?;
@@ -1655,14 +1674,14 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
         Some(v) => v,
         None => {
             log::warn!("Canon MXF fast path: Canvas Container not found in first {} MiB of essence, returning partial metadata", CANON_MXF_FAST_EU0_BYTES / 1024 / 1024);
-            return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, video_md, options));
+            return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, mxf_timezone, video_md, options));
         }
     };
 
     let eu1_offset = eu_offsets[1];
     if eu1_offset as usize <= canvas_pos_in_eu0 {
         log::warn!("Canon MXF fast path: Canvas pos {} >= EU[1] offset {}, returning partial metadata", canvas_pos_in_eu0, eu1_offset);
-        return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, video_md, options));
+        return Ok(mxf_partial_result(model_name, creation_time, creation_subsec, mxf_timezone, video_md, options));
     }
     let canvas_dist_from_next_eu = eu1_offset - canvas_pos_in_eu0 as u64;
 
@@ -1750,7 +1769,7 @@ pub(crate) fn parse_canon_mxf_fast<T: Read + Seek, F: Fn(f64)>(
         });
     }
 
-    Ok((samples, creation_time, creation_subsec, video_md))
+    Ok((samples, creation_time, creation_subsec, mxf_timezone, video_md))
 }
 
 #[cfg(test)]
@@ -1911,17 +1930,18 @@ mod tests {
         let opts = crate::InputOptions::default();
         // The placeholder sample is what lets `process_map` recover the model and land the
         // creation date; an empty vector would discard both.
-        let (samples, ct, cs, _) = mxf_partial_result(
-            Some("Canon C500 Mark II".into()), Some("2025-08-05 17:48:25".into()), Some("500".into()), None, &opts);
+        let (samples, ct, cs, tz, _) = mxf_partial_result(
+            Some("Canon C500 Mark II".into()), Some("2025-08-05 17:48:25".into()), Some("500".into()), Some("+08:00".into()), None, &opts);
         assert_eq!(samples.len(), 1);
         let map = samples[0].tag_map.as_ref().unwrap();
         let name = map.get(&GroupId::Default).and_then(|m| m.get(&TagId::Name)).unwrap();
         assert_eq!(name.value.to_string(), "C500 Mark II");
         assert_eq!(ct.as_deref(), Some("2025-08-05 17:48:25"));
         assert_eq!(cs.as_deref(), Some("500"));
+        assert_eq!(tz.as_deref(), Some("+08:00"));
 
         // Without a model there is still one sample, so the creation date keeps its landing spot.
-        let (samples, ..) = mxf_partial_result(None, Some("2025-08-05 17:48:25".into()), None, None, &opts);
+        let (samples, ..) = mxf_partial_result(None, Some("2025-08-05 17:48:25".into()), None, None, None, &opts);
         assert_eq!(samples.len(), 1);
         assert!(samples[0].tag_map.is_some());
     }
@@ -1957,7 +1977,7 @@ mod tests {
             let mut samples = Vec::new();
             canon.process_map(&mut samples, &InputOptions::default(), Some(exif::CanonExifData {
                 model: Some("Canon EOS C70".into()), movie_frame_rates: rates, ..Default::default()
-            }), Some(&video), None, None);
+            }), Some(&video), None, None, None);
             let map = samples[0].tag_map.as_ref().unwrap();
             let record = map.get(&GroupId::Default).and_then(|group| group.get_t(TagId::RecordFrameRate) as Option<&f64>);
             if rates == Some((25.0, 100.0)) {
@@ -1980,7 +2000,7 @@ mod tests {
             }).collect();
             canon.process_map(&mut samples, &InputOptions::default(), Some(exif::CanonExifData {
                 model: Some("Canon EOS R6 Mark III".into()), image_stabilizer: expected, ..Default::default()
-            }), None, None, None);
+            }), None, None, None, None);
             let mut displayed = None;
             for (index, sample) in samples.iter().enumerate() {
                 let group = &sample.tag_map.as_ref().unwrap()[&GroupId::Default];
