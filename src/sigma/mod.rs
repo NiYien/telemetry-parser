@@ -25,6 +25,7 @@ pub struct Sigma {
 #[derive(Debug, Default)]
 struct SigmaExifData {
     model: Option<String>,
+    software: Option<String>,
     focal_length: Option<f64>,
     lens_model: Option<String>,
     focal_length_35mm: Option<u32>,
@@ -34,6 +35,14 @@ struct SigmaExifData {
     datetime_original: Option<String>,
     offset_time_original: Option<String>,
     subsec_time_original: Option<String>,
+    dc_crop: Option<bool>,
+    focal_plane_geometry: Option<FocalPlaneGeometry>,
+}
+
+#[derive(Debug)]
+struct FocalPlaneGeometry {
+    dimensions: (u32, u32),
+    unit_pixel_focal_length: f64,
 }
 
 impl Sigma {
@@ -260,8 +269,7 @@ impl Sigma {
             }
         }
 
-        // Lens and focal length
-        let has_lens = exif.lens_model.as_ref().map_or(false, |l| !l.is_empty());
+        // Lens identity and focal length are independent metadata fields.
         if let Some(ref lens_name) = exif.lens_model {
             if !lens_name.is_empty() {
                 self.lens = Some(lens_name.clone());
@@ -269,14 +277,34 @@ impl Sigma {
             }
         }
 
-        if has_lens {
-            if let Some(fl) = exif.focal_length {
-                util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{:.1} mm", v), fl as f32, Vec::new()), options);
-            }
+        let focal_length = exif.focal_length.filter(|v| v.is_finite() && *v > 0.0);
+        if let Some(fl) = focal_length {
+            util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::FocalLength, "Focal length", f32, |v| format!("{:.1} mm", v), fl as f32, Vec::new()), options);
+        }
+        let projection_focal = focal_length.or(options.user_focal_length.filter(|v| v.is_finite() && *v > 0.0));
+        let dc_crop = if is_dng { None } else { exif.dc_crop };
+        let native_unit_focal = exif.focal_plane_geometry.as_ref()
+            .filter(|g| dc_crop.is_some() && g.dimensions == (resolution_w, resolution_h))
+            .map(|g| g.unit_pixel_focal_length);
+        let mut metadata = serde_json::Map::new();
+        if let Some(cropped) = dc_crop {
+            let view = if cropped { "APSC" } else { "FULL" };
+            metadata.insert("dc_crop".into(), cropped.into());
+            metadata.insert("view_angle".into(), view.into());
+            metadata.insert("resolution_format_name".into(), view.into());
+            // File identity remains available without the optional parameter database.
+            self.model = Some("fp".into());
+            util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Name, "Camera model", String, |v| v.clone(), "fp".into(), Vec::new()), options);
+        }
+        if let Some(unit) = native_unit_focal {
+            metadata.insert("unit_pixel_focal_length".into(), unit.into());
+            metadata.insert("video_width".into(), resolution_w.into());
+            metadata.insert("video_height".into(), resolution_h.into());
+            metadata.insert("effective_sensor_width_mm".into(), (resolution_w as f64 / unit).into());
         }
 
         // scale_35mm = focal_length_35mm / focal_length
-        let scale_35mm = match (exif.focal_length_35mm, exif.focal_length) {
+        let scale_35mm = match (exif.focal_length_35mm, focal_length) {
             (Some(fl35), Some(fl)) if fl35 > 0 && fl > 0.0 => Some(fl35 as f64 / fl),
             _ => None,
         };
@@ -288,43 +316,32 @@ impl Sigma {
                     self.model = Some(model_name.to_string());
                     let sensor_w = model_data.sw;
 
-                    // Crop factor: use scale_35mm if significantly > 1.0, else JSON crop rules
-                    let crop_factor = if let Some(scale) = scale_35mm.filter(|s| (*s - 1.0).abs() > 0.01) {
+                    // Native geometry already includes the capture crop; do not multiply it again.
+                    let crop_factor = if let Some(unit) = native_unit_focal {
+                        let crop = unit * sensor_w as f64 / resolution_w as f64;
+                        util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{:.4}", v), crop, Vec::new()), options);
+                        metadata.insert("crop_factor".into(), crop.into());
+                        Some(crop)
+                    } else if let Some(scale) = scale_35mm.filter(|s| (*s - 1.0).abs() > 0.01) {
                         util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{:.4}", v), scale, Vec::new()), options);
-                        scale
+                        Some(scale)
+                    } else if dc_crop == Some(true) {
+                        // An explicit crop without valid geometry must not borrow full-frame defaults.
+                        None
                     } else {
                         let tags = std::collections::HashMap::new();
-                        db.process_crop("SIGMA", model_name, resolution_w, resolution_h, fps, None, &tags, map, options)
+                        Some(db.process_crop("SIGMA", model_name, resolution_w, resolution_h, fps, None, &tags, map, options))
                     };
 
-                    // Unit pixel focal length
-                    if resolution_w > 0 {
-                        let unit_px_fl = if let Some(scale) = scale_35mm.filter(|s| (s - 1.0).abs() > 0.01) {
-                            scale / 36.0 * resolution_w as f64
+                    let unit_px_fl = native_unit_focal.or_else(|| crop_factor
+                        .filter(|_| resolution_w > 0 && sensor_w.is_finite() && sensor_w > 0.0)
+                        .map(|crop| if scale_35mm.is_some_and(|s| (s - 1.0).abs() > 0.01) {
+                            crop / 36.0 * resolution_w as f64
                         } else {
-                            resolution_w as f64 * crop_factor / sensor_w as f64
-                        };
-                        if unit_px_fl > 0.0 {
-                            util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit_px_fl, Vec::new()), options);
-                        }
-                    }
-
-                    // Pixel focal length
-                    {
-                        let fl = if has_lens { exif.focal_length } else { None }.or(options.user_focal_length);
-                        if let Some(fl) = fl {
-                            if resolution_w > 0 {
-                                let fx = if let Some(scale) = scale_35mm.filter(|s| (s - 1.0).abs() > 0.01) {
-                                    fl * scale / 36.0 * resolution_w as f64
-                                } else {
-                                    util::calc_pixel_focal_length(fl, sensor_w, resolution_w, crop_factor)
-                                };
-                                if fx > 0.0 {
-                                    util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{:.2}", v), fx as f32, Vec::new()), options);
-                                }
-                            }
-                        }
-                    }
+                            resolution_w as f64 * crop / sensor_w as f64
+                        }));
+                    insert_geometry_tags(map, unit_px_fl, projection_focal, options);
+                    insert_metadata(map, &metadata, options);
 
                     // Readout
                     if self.frame_readout_time.is_none() {
@@ -373,6 +390,9 @@ impl Sigma {
             }
         }
 
+        insert_geometry_tags(map, native_unit_focal, projection_focal, options);
+        insert_metadata(map, &metadata, options);
+
         // Fallback creation date (no JSON db match)
         let is_fp_mov = !is_dng && exif.model.as_deref().unwrap_or("").to_lowercase().contains("fp");
         if is_fp_mov {
@@ -394,6 +414,21 @@ impl Sigma {
         } else if let Some(ref mvhd_time) = self.mvhd_creation_time {
             util::write_creation_date_tags(map, mvhd_time, None, Some("500"), options);
         }
+    }
+}
+
+fn insert_geometry_tags(map: &mut GroupedTagMap, unit: Option<f64>, focal: Option<f64>, options: &crate::InputOptions) {
+    if let Some(unit) = unit.filter(|v| v.is_finite() && *v > 0.0) {
+        util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::Custom("unit_pixel_focal_length".into()), "Pixel focal length per mm", f64, |v| format!("{:.4}", v), unit, Vec::new()), options);
+        if let Some(pixel_focal) = focal.map(|f| (f * unit) as f32).filter(|v| v.is_finite() && *v > 0.0) {
+            util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::PixelFocalLength, "Pixel focal length", f32, |v| format!("{:.2}", v), pixel_focal, Vec::new()), options);
+        }
+    }
+}
+
+fn insert_metadata(map: &mut GroupedTagMap, metadata: &serde_json::Map<String, serde_json::Value>, options: &crate::InputOptions) {
+    if !metadata.is_empty() {
+        util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Metadata, "Metadata", Json, |v| v.to_string(), serde_json::Value::Object(metadata.clone()), Vec::new()), options);
     }
 }
 
@@ -450,11 +485,20 @@ fn parse_tiff_ifd(tiff_data: &[u8]) -> Result<SigmaExifData> {
 
     let mut result = SigmaExifData::default();
     let mut exif_ifd_offset = None;
+    let mut maker_note = None;
+    let mut exif_width = None;
+    let mut exif_height = None;
+    let mut focal_plane_x = None;
+    let mut focal_plane_y = None;
+    let mut focal_plane_unit = None;
 
     parse_ifd_entries(tiff_data, ifd0_offset, is_le, &mut |tag, _typ, count, value_data, value_offset| {
         match tag {
             0x0110 => { // Model
                 result.model = Some(read_string(value_data, count));
+            }
+            0x0131 => { // Software
+                result.software = Some(read_string(value_data, count));
             }
             0x8769 => { // ExifIFD offset
                 exif_ifd_offset = read_u32(tiff_data, value_offset, is_le).map(|v| v as usize);
@@ -504,7 +548,7 @@ fn parse_tiff_ifd(tiff_data: &[u8]) -> Result<SigmaExifData> {
 
     // Parse ExifIFD
     if let Some(offset) = exif_ifd_offset {
-        parse_ifd_entries(tiff_data, offset, is_le, &mut |tag, _typ, count, value_data, _value_offset| {
+        parse_ifd_entries(tiff_data, offset, is_le, &mut |tag, _typ, count, value_data, value_offset| {
             match tag {
                 0x920A => { // FocalLength (RATIONAL)
                     if value_data.len() >= 8 {
@@ -540,13 +584,68 @@ fn parse_tiff_ifd(tiff_data: &[u8]) -> Result<SigmaExifData> {
                         }
                     }
                 }
+                0x927C if _typ == 7 => maker_note = Some((value_offset, count)),
+                0xA002 | 0xA003 if count == 1 => {
+                    let dimension = match _typ {
+                        3 => read_u16(value_data, 0, is_le).map(u32::from),
+                        4 => read_u32(value_data, 0, is_le),
+                        _ => None,
+                    }.filter(|v| *v > 0);
+                    if tag == 0xA002 { exif_width = dimension; } else { exif_height = dimension; }
+                }
+                0xA20E | 0xA20F if _typ == 5 && count == 1 => {
+                    let density = positive_rational(value_data, is_le);
+                    if tag == 0xA20E { focal_plane_x = density; } else { focal_plane_y = density; }
+                }
+                0xA210 if _typ == 3 && count == 1 => focal_plane_unit = read_u16(value_data, 0, is_le),
                 _ => {}
             }
         });
     }
 
+    // Only the fp 5.02 / MakerNote 4.01 layout has been verified against firmware.
+    let verified_fp = result.model.as_deref().is_some_and(|v| v.trim().eq_ignore_ascii_case("SIGMA fp"))
+        && result.software.as_deref().is_some_and(|v| v.starts_with("SIGMA fp Ver.5.02."));
+    if verified_fp {
+        result.dc_crop = maker_note.and_then(|(offset, len)| parse_fp_dc_crop(tiff_data, offset, len, is_le));
+        if result.dc_crop.is_some() {
+            let mm_per_unit = match focal_plane_unit { Some(2) => Some(25.4), Some(3) => Some(10.0), _ => None };
+            if let (Some(w), Some(h), Some(x), Some(y), Some(mm)) = (exif_width, exif_height, focal_plane_x, focal_plane_y, mm_per_unit) {
+                // The verified firmware writes the same density for both sensor axes.
+                if (x - y).abs() <= x.max(y) * 1e-6 {
+                    result.focal_plane_geometry = Some(FocalPlaneGeometry { dimensions: (w, h), unit_pixel_focal_length: x / mm });
+                }
+            }
+        }
+    }
+
     Ok(result)
 }
+
+fn positive_rational(data: &[u8], is_le: bool) -> Option<f64> {
+    let numerator = read_u32(data, 0, is_le)?;
+    let denominator = read_u32(data, 4, is_le)?;
+    (numerator > 0 && denominator > 0).then(|| numerator as f64 / denominator as f64)
+}
+
+fn parse_fp_dc_crop(tiff_data: &[u8], offset: usize, len: usize, is_le: bool) -> Option<bool> {
+    let end = offset.checked_add(len)?;
+    let maker = tiff_data.get(offset..end)?;
+    if maker.get(..8)? != b"SIGMA\0\0\0" || read_u16(maker, 8, is_le)? != 0x0401 { return None; }
+    let entries = read_u16(maker, 10, is_le)? as usize;
+    if 12 + entries * 12 + 4 > maker.len() { return None; }
+    let mut crop = None;
+    // Value offsets remain relative to the containing TIFF; limit reads to the declared MakerNote end.
+    parse_ifd_entries(&tiff_data[..end], offset + 10, is_le, &mut |tag, typ, count, value, _| {
+        if tag == 0x010A && typ == 1 && count == 1 && value.len() == 1 {
+            crop = Some(value[0] & 0x40 != 0);
+        }
+    });
+    crop
+}
+
+#[cfg(test)]
+mod crop_tests;
 
 
 #[cfg(test)]
