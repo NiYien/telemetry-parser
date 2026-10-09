@@ -58,6 +58,76 @@ fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     out
 }
 
+fn video_track(handler: &[u8; 4], entries: &[([u8; 4], u16, u16)]) -> Vec<u8> {
+    let mut hdlr = vec![0; 8];
+    hdlr.extend_from_slice(handler);
+    let mut stsd = vec![0; 4];
+    stsd.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (codec, width, height) in entries {
+        let mut entry = vec![0; 78];
+        entry[24..26].copy_from_slice(&width.to_be_bytes());
+        entry[26..28].copy_from_slice(&height.to_be_bytes());
+        entry.extend(atom(b"pasp", &[0, 0, 0, 133, 0, 0, 0, 100]));
+        stsd.extend(atom(codec, &entry));
+    }
+    let mut mdia = atom(b"hdlr", &hdlr);
+    mdia.extend(atom(b"minf", &atom(b"stbl", &atom(b"stsd", &stsd))));
+    let mut track = atom(b"tkhd", &[0xff; 84]);
+    track.extend(atom(b"mdia", &mdia));
+    atom(b"trak", &track)
+}
+
+#[test]
+fn coded_dimensions_ignore_display_canvas_and_sar() {
+    for codec in [*b"hvc1", *b"hev1", *b"avc1", *b"apch", *b"ap4h"] {
+        let mut moov = video_track(b"soun", &[(codec, 10, 20)]);
+        moov.extend(video_track(b"vide", &[(codec, 3840, 2464)]));
+        moov.extend(video_track(b"vide", &[(codec, 1920, 1080)]));
+        assert_eq!(metadata::parse_moov(&moov).coded_size, Some((3840, 2464)));
+    }
+}
+
+#[test]
+fn coded_dimensions_reject_invalid_and_changing_entries() {
+    for entries in [vec![(*b"hvc1", 0, 2464)], vec![(*b"junk", 3840, 2464)],
+        vec![(*b"hvc1", 3840, 2464), (*b"hvc1", 1920, 1080)], vec![]] {
+        let mut moov = video_track(b"vide", &entries);
+        moov.extend(video_track(b"vide", &[(*b"hvc1", 1920, 1080)]));
+        assert_eq!(metadata::parse_moov(&moov).coded_size, None);
+    }
+    let moov = video_track(b"vide", &[(*b"hvc1", 3840, 2464)]);
+    for length in [0, 7, moov.len() - 1] {
+        assert_eq!(metadata::parse_moov(&moov[..length]).coded_size, None);
+    }
+}
+
+#[test]
+#[ignore = "Set KINEFINITY_SAMPLE and KINEFINITY_CAMERA_DB to the anamorphic VISTA fixture"]
+fn real_vista_anamorphic_sample_uses_encoded_dimensions() {
+    let path = std::env::var("KINEFINITY_SAMPLE").unwrap();
+    let mut stream = std::fs::File::open(&path).unwrap();
+    let size = stream.metadata().unwrap().len() as usize;
+    let canvas = util::get_video_metadata(&mut stream, size).unwrap();
+    let data = metadata::read_container(&mut stream, size).unwrap();
+    println!("canvas={canvas:?}, camera={data:?}");
+    assert_eq!(data.coded_size, Some((3840, 2464)));
+    stream.rewind().unwrap();
+    let input = Input::from_stream_with_options(&mut stream, size, &path, |_| (),
+        Arc::new(AtomicBool::new(false)), InputOptions {
+            camera_db_path: Some(std::env::var("KINEFINITY_CAMERA_DB").unwrap()),
+            ..Default::default()
+        }).unwrap();
+    let map = input.samples.as_ref().unwrap()[0].tag_map.as_ref().unwrap();
+    assert_eq!(map[&GroupId::Default].get_t(TagId::Custom("video_width".into())) as Option<&u32>, Some(&3840));
+    assert_eq!(map[&GroupId::Default].get_t(TagId::Custom("video_height".into())) as Option<&u32>, Some(&2464));
+    let additional: &serde_json::Value = map[&GroupId::Default].get_t(TagId::Metadata).unwrap();
+    println!("readout={:?}, metadata={additional}", input.frame_readout_time());
+    // This firmware omits the sensor format and oversampling mode. Do not guess them from SAR.
+    assert!(data.image_format.is_none());
+    assert!(data.oversampling.is_none());
+    assert!(input.frame_readout_time().is_none());
+}
+
 fn meta(fields: &[(&str, &str)], fullbox: bool) -> Vec<u8> {
     let mut keys = vec![0; 4];
     keys.extend_from_slice(&(fields.len() as u32).to_be_bytes());

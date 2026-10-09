@@ -14,6 +14,7 @@ pub struct ClipData {
     pub oversampling: Option<bool>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub coded_size: Option<(u32, u32)>,
     pub sensor_fps: Option<f64>,
     pub project_fps: Option<f64>,
     pub focal_length: Option<f64>,
@@ -380,11 +381,48 @@ fn parse_meta(data: &[u8]) -> Value {
     Value::Object(values)
 }
 
+fn video_media(track: &[u8]) -> Option<&[u8]> {
+    let mdia = boxes(track).find(|(kind, _)| kind == b"mdia")?.1;
+    let handler = boxes(mdia).find(|(kind, _)| kind == b"hdlr")?.1;
+    if handler.get(8..12) != Some(b"vide") { return None; }
+    Some(mdia)
+}
+
+fn coded_video_size(mdia: &[u8]) -> Option<(u32, u32)> {
+    let minf = boxes(mdia).find(|(kind, _)| kind == b"minf")?.1;
+    let stbl = boxes(minf).find(|(kind, _)| kind == b"stbl")?.1;
+    let stsd = boxes(stbl).find(|(kind, _)| kind == b"stsd")?.1;
+    let count = u32_at(stsd, 4).filter(|&n| n > 0 && n <= 1024)?;
+    let mut size = None;
+    let mut seen = 0;
+    for (kind, entry) in boxes(stsd.get(8..)?).take(count as usize) {
+        if !matches!(&kind, b"avc1" | b"avc3" | b"hvc1" | b"hev1" |
+            b"apch" | b"apcn" | b"apcs" | b"apco" | b"ap4h" | b"ap4x") || entry.len() < 78 {
+            return None;
+        }
+        let width = u16::from_be_bytes(entry[24..26].try_into().ok()?) as u32;
+        let height = u16::from_be_bytes(entry[26..28].try_into().ok()?) as u32;
+        if width == 0 || height == 0 || size.is_some_and(|old| old != (width, height)) {
+            return None;
+        }
+        size = Some((width, height));
+        seen += 1;
+    }
+    (seen == count).then_some(size).flatten()
+}
+
 pub fn parse_moov(data: &[u8]) -> ClipData {
     let mut result = ClipData::default();
+    let mut video_track_seen = false;
     for (kind, payload) in boxes(data) {
         match &kind {
             b"meta" => result.merge_missing(from_json(&parse_meta(payload))),
+            b"trak" if !video_track_seen => {
+                if let Some(mdia) = video_media(payload) {
+                    video_track_seen = true;
+                    result.coded_size = coded_video_size(mdia);
+                }
+            }
             b"udta" => {
                 for (kind, payload) in boxes(payload) {
                     if &kind == b"meta" {

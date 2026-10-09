@@ -69,8 +69,18 @@ impl Kinefinity {
         _cancel_flag: Arc<AtomicBool>,
         options: InputOptions,
     ) -> std::io::Result<Vec<SampleInfo>> {
-        let video = util::get_video_metadata(stream, size).ok();
+        let mut video = util::get_video_metadata(stream, size).ok();
         let mut data = metadata::read_container(stream, size)?;
+        if video.is_none() && data.coded_size.is_some() {
+            video = Some(VideoMetadata::default());
+        }
+        if let Some(video) = video.as_mut() {
+            // tkhd describes the display canvas, which may already include anamorphic SAR.
+            // Only the encoded raster (or recorded dimensions below) defines sensor geometry.
+            let (width, height) = data.coded_size.unwrap_or_default();
+            video.width = width as usize;
+            video.height = height as usize;
+        }
         if !options.dont_look_for_sidecar_files {
             metadata::merge_sidecars(&self.video_path, &mut data);
         }
