@@ -3,7 +3,15 @@
 use super::*;
 
 // These are metadata fixtures, not claims of physical-device validation.
-const IPHONE_14_18_MODELS: &[(&str, &[f64])] = &[
+const IPHONE_12_18_MODELS: &[(&str, &[f64])] = &[
+    ("iPhone 12", &[26.0, 13.0]),
+    ("iPhone 12 mini", &[26.0, 13.0]),
+    ("iPhone 12 Pro", &[26.0, 13.0, 52.0]),
+    ("iPhone 12 Pro Max", &[26.0, 13.0, 65.0]),
+    ("iPhone 13", &[26.0, 13.0]),
+    ("iPhone 13 mini", &[26.0, 13.0]),
+    ("iPhone 13 Pro", &[26.0, 13.0, 77.0]),
+    ("iPhone 13 Pro Max", &[26.0, 13.0, 77.0]),
     ("iPhone 14", &[26.0, 13.0]),
     ("iPhone 14 Plus", &[26.0, 13.0]),
     ("iPhone 14 Pro", &[24.0, 13.0, 77.0]),
@@ -27,8 +35,8 @@ const IPHONE_14_18_MODELS: &[(&str, &[f64])] = &[
 ];
 
 #[test]
-fn iphone_14_through_18_variants_read_legacy_and_track_level_focal_length() {
-    for &(model, focals) in IPHONE_14_18_MODELS {
+fn iphone_12_through_18_variants_read_legacy_and_track_level_focal_length() {
+    for &(model, focals) in IPHONE_12_18_MODELS {
         for &focal in focals {
             let legacy_model = format!("Apple {model} {focal}mm");
             let legacy_lens = format!("{model} {focal}mm");
@@ -77,16 +85,17 @@ fn equivalent_tag_wins_and_physical_lens_mm_are_never_used_as_equivalent() {
 
 #[test]
 #[ignore = "Set PHONE_CAMERA_DB to validate the authoritative Apple table"]
-fn authoritative_iphone_14_18_table() {
+fn authoritative_iphone_12_18_table() {
     let db = camera_db::CameraDatabase::load(&std::env::var("PHONE_CAMERA_DB").unwrap()).unwrap();
     let table = &db.get_brand("APPLE").unwrap().readout;
-    for &(model, focals) in IPHONE_14_18_MODELS {
+    for &(model, focals) in IPHONE_12_18_MODELS {
         for &focal in focals {
             let key = format!("{model} {focal}mm");
             let row = table.data.get(&key).unwrap_or_else(|| panic!("Missing {key}"));
             assert_eq!(row.len(), table.columns.len(), "{key}");
             assert!(row.iter().flatten().all(|v| v.is_finite() && *v < 0.0), "{key}");
-            assert_eq!(lookup_readout(&db, &key, 1920, 1080, 60.0), None);
+            let hd60 = if model == "iPhone 14" && focal == 26.0 { Some((5.5, true)) } else { None };
+            assert_eq!(lookup_readout(&db, &key, 1920, 1080, 60.0), hd60, "{key}");
         }
     }
     for model in ["iPhone 15 Pro", "iPhone 15 Pro Max"] {
@@ -96,8 +105,41 @@ fn authoritative_iphone_14_18_table() {
     assert_eq!(lookup_readout(&db, "iPhone 17 Pro 13mm", 3840, 2160, 25.0), Some((6.0, true)));
     assert_eq!(lookup_readout(&db, "iPhone 17 Pro 13mm", 4224, 2240, 25.0), Some((5.6, true)));
     assert_eq!(lookup_readout(&db, "iPhone 17 Pro Max 24mm", 4224, 2240, 60.0), Some((2.3, true)));
-    for model in ["iPhone 14 Pro", "iPhone 14 Pro Max", "iPhone 16 Pro", "iPhone 18 Pro", "iPhone 18 Pro Max"] {
+    for model in ["iPhone 14 Pro Max", "iPhone 16 Pro", "iPhone 18 Pro"] {
         assert_eq!(lookup_readout(&db, &format!("{model} 24mm"), 3840, 2160, 25.0), None);
+    }
+    for (lens, w, h, fps, expected) in [
+        ("iPhone 12 Pro Max 26mm", 3840, 2160, 24.0, 5.0),
+        ("iPhone 13 Pro 26mm", 3840, 2160, 25.0, 6.8),
+        ("iPhone 13 Pro 77mm", 3840, 2160, 30.0, 5.0),
+        ("iPhone 14 Pro 24mm", 3840, 2160, 25.0, 9.0),
+        ("iPhone 14 26mm", 1920, 1080, 120.0, 5.5),
+        ("iPhone 15 Pro Max 24mm", 1920, 1080, 30.0, 7.3),
+        ("iPhone 17 Pro 24mm", 3840, 2160, 25.0, 3.0),
+        ("iPhone 17 Pro 13mm", 4224, 3024, 24.0, 7.4),
+        ("iPhone 17 Pro Max 24mm", 4224, 3024, 30.0, 3.1),
+        ("iPhone 18 Pro Max 24mm", 3840, 2160, 25.0, 2.4),
+        ("iPhone 18 Pro Max 24mm", 4224, 2240, 60.0, 2.4),
+        ("iPhone 18 Pro Max 24mm", 4224, 3024, 25.0, 3.0),
+        ("iPhone 18 Pro Max 13mm", 4224, 2240, 25.0, 6.0),
+    ] {
+        assert_eq!(lookup_readout(&db, lens, w, h, fps), Some((expected, true)), "{lens} {w}x{h}@{fps}");
+        assert_eq!(lookup_readout(&db, lens, w, h, fps / 1.001), Some((expected, true)));
+    }
+    for (lens, w, h, fps) in [
+        ("iPhone 12 Pro 26mm", 3840, 2160, 25.0),
+        ("iPhone 12 Pro Max 26mm", 3840, 2160, 60.0),
+        ("iPhone 13 Pro 26mm", 3840, 2160, 60.0),
+        ("iPhone 13 Pro Max 26mm", 3840, 2160, 25.0),
+        ("iPhone 14 Pro 24mm", 3840, 2160, 60.0),
+        ("iPhone 14 26mm", 3840, 2160, 60.0),
+        ("iPhone 15 Pro Max 24mm", 1920, 1080, 120.0),
+        ("iPhone 17 Pro 24mm", 3840, 2160, 60.0),
+        ("iPhone 17 Pro Max 24mm", 4224, 3024, 60.0),
+        ("iPhone 18 Pro Max 13mm", 3840, 2160, 25.0),
+        ("iPhone 18 Pro Max 24mm", 4224, 2240, 120.0),
+    ] {
+        assert_eq!(lookup_readout(&db, lens, w, h, fps), None, "{lens} {w}x{h}@{fps}");
     }
 }
 fn atom(name: &[u8; 4], value: &[u8]) -> Vec<u8> {
