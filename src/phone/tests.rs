@@ -88,33 +88,85 @@ fn equivalent_tag_wins_and_physical_lens_mm_are_never_used_as_equivalent() {
 fn authoritative_iphone_12_18_table() {
     let db = camera_db::CameraDatabase::load(&std::env::var("PHONE_CAMERA_DB").unwrap()).unwrap();
     let table = &db.get_brand("APPLE").unwrap().readout;
+    let common_rates = [24.0, 25.0, 30.0, 48.0, 50.0, 60.0];
+    assert_eq!(table.data.len(), IPHONE_12_18_MODELS.iter().map(|(_, focals)| focals.len()).sum::<usize>());
     for &(model, focals) in IPHONE_12_18_MODELS {
         for &focal in focals {
             let key = format!("{model} {focal}mm");
             let row = table.data.get(&key).unwrap_or_else(|| panic!("Missing {key}"));
             assert_eq!(row.len(), table.columns.len(), "{key}");
             assert!(row.iter().flatten().all(|v| v.is_finite() && *v < 0.0), "{key}");
-            let hd60 = if model == "iPhone 14" && focal == 26.0 { Some((5.5, true)) } else { None };
-            assert_eq!(lookup_readout(&db, &key, 1920, 1080, 60.0), hd60, "{key}");
+            for (w, h) in [(3840, 2160), (1920, 1080)] {
+                for fps in common_rates {
+                    let estimate = lookup_readout(&db, &key, w, h, fps)
+                        .unwrap_or_else(|| panic!("Missing fallback for {key} {w}x{h}@{fps}"));
+                    assert!(estimate.0 > 0.0 && estimate.0 < 1000.0 / fps && estimate.1);
+                    assert_eq!(lookup_readout(&db, &key, w, h, fps / 1.001), Some(estimate));
+                }
+            }
+            if matches!(model, "iPhone 17 Pro" | "iPhone 17 Pro Max" | "iPhone 18 Pro" | "iPhone 18 Pro Max") {
+                for h in [2240, 3024] {
+                    for fps in common_rates {
+                        let estimate = lookup_readout(&db, &key, 4224, h, fps)
+                            .unwrap_or_else(|| panic!("Missing RAW fallback for {key} 4224x{h}@{fps}"));
+                        assert!(estimate.0 > 0.0 && estimate.0 < 1000.0 / fps && estimate.1);
+                        assert_eq!(lookup_readout(&db, &key, 4224, h, fps / 1.001), Some(estimate));
+                    }
+                }
+            }
+        }
+        let main = format!("{model} {}mm", focals[0]);
+        for fps in [100.0, 120.0] {
+            let estimate = lookup_readout(&db, &main, 1920, 1080, fps).unwrap();
+            assert!(estimate.0 > 0.0 && estimate.0 < 1000.0 / fps && estimate.1);
+            assert_eq!(lookup_readout(&db, &main, 1920, 1080, fps / 1.001), Some(estimate));
+            let uhd = lookup_readout(&db, &main, 3840, 2160, fps);
+            if matches!(model, "iPhone 16 Pro" | "iPhone 16 Pro Max" | "iPhone 17 Pro" | "iPhone 17 Pro Max" | "iPhone 18 Pro" | "iPhone 18 Pro Max") {
+                let estimate = uhd.unwrap();
+                assert!(estimate.0 > 0.0 && estimate.0 < 1000.0 / fps && estimate.1);
+            } else {
+                assert_eq!(uhd, None, "{main} UHD@{fps}");
+            }
         }
     }
     for model in ["iPhone 15 Pro", "iPhone 15 Pro Max"] {
         assert_eq!(lookup_readout(&db, &format!("{model} 24mm"), 3840, 2160, 25.0), Some((5.3, true)));
-        assert_eq!(lookup_readout(&db, &format!("{model} 24mm"), 3840, 2160, 60.0), None);
+        assert_eq!(lookup_readout(&db, &format!("{model} 24mm"), 3840, 2160, 60.0), Some((5.3, true)));
     }
     assert_eq!(lookup_readout(&db, "iPhone 17 Pro 13mm", 3840, 2160, 25.0), Some((6.0, true)));
     assert_eq!(lookup_readout(&db, "iPhone 17 Pro 13mm", 4224, 2240, 25.0), Some((5.6, true)));
     assert_eq!(lookup_readout(&db, "iPhone 17 Pro Max 24mm", 4224, 2240, 60.0), Some((2.3, true)));
-    for model in ["iPhone 14 Pro Max", "iPhone 16 Pro", "iPhone 18 Pro"] {
-        assert_eq!(lookup_readout(&db, &format!("{model} 24mm"), 3840, 2160, 25.0), None);
+    // Cover every common rate within the sources' explicit measurement ranges.
+    for (lens, w, h, rates, expected) in [
+        ("iPhone 16 Pro Max 24mm", 3840, 2160, &[24.0, 25.0, 30.0, 48.0, 50.0, 60.0, 100.0, 120.0][..], 2.4),
+        ("iPhone 16 Pro Max 13mm", 3840, 2160, &[24.0, 25.0, 30.0, 48.0, 50.0, 60.0][..], 5.8),
+        ("iPhone 16 Pro Max 120mm", 3840, 2160, &[24.0, 25.0, 30.0, 48.0, 50.0, 60.0][..], 5.5),
+        ("iPhone 17 Pro Max 24mm", 4224, 2240, &[24.0, 25.0, 30.0, 48.0, 50.0, 60.0][..], 2.3),
+        ("iPhone 18 Pro Max 24mm", 4224, 2240, &[24.0, 25.0, 30.0, 48.0, 50.0, 60.0][..], 2.4),
+    ] {
+        for &fps in rates {
+            assert_eq!(lookup_readout(&db, lens, w, h, fps), Some((expected, true)), "{lens} {w}x{h}@{fps}");
+            assert_eq!(lookup_readout(&db, lens, w, h, fps / 1.001), Some((expected, true)));
+        }
     }
     for (lens, w, h, fps, expected) in [
+        ("iPhone 12 26mm", 3840, 2160, 25.0, 6.6),
+        ("iPhone 12 Pro 26mm", 3840, 2160, 25.0, 6.8),
         ("iPhone 12 Pro Max 26mm", 3840, 2160, 24.0, 5.0),
         ("iPhone 13 Pro 26mm", 3840, 2160, 25.0, 6.8),
         ("iPhone 13 Pro 77mm", 3840, 2160, 30.0, 5.0),
+        ("iPhone 13 Pro Max 26mm", 3840, 2160, 25.0, 6.8),
         ("iPhone 14 Pro 24mm", 3840, 2160, 25.0, 9.0),
         ("iPhone 14 26mm", 1920, 1080, 120.0, 5.5),
+        ("iPhone 14 Plus 26mm", 1920, 1080, 120.0, 5.5),
+        ("iPhone 14 Pro Max 24mm", 3840, 2160, 25.0, 9.0),
+        ("iPhone 15 26mm", 3840, 2160, 25.0, 7.0),
         ("iPhone 15 Pro Max 24mm", 1920, 1080, 30.0, 7.3),
+        ("iPhone 15 Pro Max 24mm", 1920, 1080, 120.0, 4.5),
+        ("iPhone 16 Pro 24mm", 3840, 2160, 25.0, 2.4),
+        ("iPhone 16e 26mm", 3840, 2160, 25.0, 7.0),
+        ("iPhone 17e 26mm", 3840, 2160, 25.0, 7.0),
+        ("iPhone Air 26mm", 3840, 2160, 25.0, 7.0),
         ("iPhone 17 Pro 24mm", 3840, 2160, 25.0, 3.0),
         ("iPhone 17 Pro 13mm", 4224, 3024, 24.0, 7.4),
         ("iPhone 17 Pro Max 24mm", 4224, 3024, 30.0, 3.1),
@@ -122,21 +174,25 @@ fn authoritative_iphone_12_18_table() {
         ("iPhone 18 Pro Max 24mm", 4224, 2240, 60.0, 2.4),
         ("iPhone 18 Pro Max 24mm", 4224, 3024, 25.0, 3.0),
         ("iPhone 18 Pro Max 13mm", 4224, 2240, 25.0, 6.0),
+        ("iPhone 18 Pro 24mm", 3840, 2160, 25.0, 2.4),
+        ("iPhone 18 Pro Max 13mm", 4224, 3024, 60.0, 8.1),
     ] {
         assert_eq!(lookup_readout(&db, lens, w, h, fps), Some((expected, true)), "{lens} {w}x{h}@{fps}");
         assert_eq!(lookup_readout(&db, lens, w, h, fps / 1.001), Some((expected, true)));
     }
     for (lens, w, h, fps) in [
-        ("iPhone 12 Pro 26mm", 3840, 2160, 25.0),
-        ("iPhone 12 Pro Max 26mm", 3840, 2160, 60.0),
-        ("iPhone 13 Pro 26mm", 3840, 2160, 60.0),
-        ("iPhone 13 Pro Max 26mm", 3840, 2160, 25.0),
-        ("iPhone 14 Pro 24mm", 3840, 2160, 60.0),
-        ("iPhone 14 26mm", 3840, 2160, 60.0),
-        ("iPhone 15 Pro Max 24mm", 1920, 1080, 120.0),
-        ("iPhone 17 Pro 24mm", 3840, 2160, 60.0),
-        ("iPhone 17 Pro Max 24mm", 4224, 3024, 60.0),
-        ("iPhone 18 Pro Max 13mm", 3840, 2160, 25.0),
+        ("iPhone 12 Pro 26mm", 4224, 3024, 25.0),
+        ("iPhone 12 Pro Max 26mm", 3840, 2160, 120.0),
+        ("iPhone 13 Pro 26mm", 3840, 2160, 120.0),
+        ("iPhone 14 Pro 24mm", 3840, 2160, 120.0),
+        ("iPhone 15 Pro Max 24mm", 3840, 2160, 120.0),
+        ("iPhone 16 Pro Max 13mm", 3840, 2160, 120.0),
+        ("iPhone 16 26mm", 4224, 2240, 25.0),
+        ("iPhone 17 26mm", 4224, 2240, 25.0),
+        ("iPhone 17 Pro 24mm", 4096, 2160, 25.0),
+        ("iPhone 17 Pro 24mm", 3840, 2160, 59.963),
+        ("iPhone 18 Pro Max 48mm", 3840, 2160, 25.0),
+        ("iPhone 18 Pro Max 13mm", 1920, 1080, 120.0),
         ("iPhone 18 Pro Max 24mm", 4224, 2240, 120.0),
     ] {
         assert_eq!(lookup_readout(&db, lens, w, h, fps), None, "{lens} {w}x{h}@{fps}");
@@ -301,23 +357,28 @@ fn creation_date_keeps_subseconds_and_crosses_day_boundary() {
 #[ignore = "Set PHONE_SAMPLE_DIR to the two original Blackmagic Camera clips"]
 fn real_iphone_clips() {
     let dir = std::path::PathBuf::from(std::env::var_os("PHONE_SAMPLE_DIR").unwrap());
+    let camera_db_path = std::env::var("PHONE_CAMERA_DB").ok();
+    let expected_readout = camera_db_path.as_ref().map(|_| 2.4);
     for (name, utc) in [("A001_05092045_C020.mov", "2025:05:09 12:45:42"), ("A001_05092046_C022.mov", "2025:05:09 12:46:09")] {
         let path = dir.join(name);
         let mut stream = std::fs::File::open(&path).unwrap();
         let size = stream.metadata().unwrap().len() as usize;
         let input = Input::from_stream_with_options(&mut stream, size, &path, |_| {}, Arc::new(AtomicBool::new(false)), InputOptions {
-            camera_db_path: std::env::var("PHONE_CAMERA_DB").ok(), ..Default::default()
+            camera_db_path: camera_db_path.clone(), ..Default::default()
         }).unwrap();
         assert_eq!(input.camera_type(), "Apple");
         assert_eq!(input.camera_model().map(String::as_str), Some("iPhone 16 Pro Max"));
-        assert_eq!(input.frame_readout_time(), None);
+        assert_eq!(input.frame_readout_time(), expected_readout);
         assert!(!input.has_accurate_timestamps());
         let map = input.samples.as_ref().unwrap()[0].tag_map.as_ref().unwrap();
+        if expected_readout.is_some() {
+            assert_eq!(GetWithType::<bool>::get_t(&map[&GroupId::Imager], TagId::Custom("readout_estimated".into())), Some(&true));
+        }
         assert_eq!(string(map, GroupId::Default, TagId::CreationDateUtc).map(String::as_str), Some(utc));
         assert_eq!(GetWithType::<f32>::get_t(&map[&GroupId::Lens], TagId::PixelFocalLength), Some(&1280.0));
         assert_eq!(GetWithType::<f64>::get_t(&map[&GroupId::Lens], TagId::Custom("unit_pixel_focal_length".into())), Some(&(1920.0 / 36.0)));
         assert!(util::normalized_imu(&input, None).unwrap().is_empty());
-        println!("{name}: Apple iPhone 16 Pro Max, equivalent=24mm, fx=1280px (estimate), UTC={utc}, readout=unknown, IMU=0");
+        println!("{name}: Apple iPhone 16 Pro Max, equivalent=24mm, fx=1280px (estimate), UTC={utc}, readout={expected_readout:?}ms (estimate when present), IMU=0");
 
         // Remove the recorded focal suffix in memory; keep the scale for manual focal entry.
         let mut without_focal = std::fs::read(&path).unwrap();
