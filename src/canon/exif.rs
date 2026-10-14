@@ -30,6 +30,8 @@ pub struct CanonExifData {
     /// MakerNote CameraSettings (0x0001), element 34, using ExifTool's value table.
     pub image_stabilizer: Option<bool>,
     pub canon_fine: bool,
+    /// CameraSettings record mode 11 and image size 147 identify a CRM SRAW recording.
+    pub canon_sraw: bool,
     /// MakerNote 0x0034: playback and recording frame rates, respectively.
     pub movie_frame_rates: Option<(f64, f64)>,
     /// MakerNote 0x4049: the dedicated movie-cropping setting.
@@ -402,6 +404,10 @@ fn parse_canon_makernotes(tiff_data: &[u8], offset: usize, _count: usize, is_le:
 fn parse_canon_makernote_entry(tag: u16, typ: u16, count: usize, value_data: &[u8], is_le: bool, result: &mut CanonExifData) {
     match tag {
         0x0001 => {
+            if matches!(typ, 3 | 8) && count > 10 && value_data.len() >= 22 {
+                result.canon_sraw = read_u16(value_data, 18, is_le) == 11
+                    && read_u16(value_data, 20, is_le) == 147;
+            }
             // Canon.pm CameraSettings[34]: Off/Off (2), then the enabled IS modes.
             // Unknown values stay unknown rather than being treated as enabled.
             if matches!(typ, 3 | 8) && count > 34 && value_data.len() >= 70 {
@@ -505,6 +511,27 @@ mod tests {
                     let mut data = CanonExifData::default();
                     parse_canon_makernote_entry(0x0001, typ, 35, &bytes, is_le, &mut data);
                     assert_eq!(data.image_stabilizer, expected, "raw={raw} typ={typ} is_le={is_le}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sraw_camera_settings_require_crm_record_mode_and_sraw_image_size() {
+        for is_le in [false, true] {
+            for (mode, size, expected) in [(11u16,147u16,true), (11,144,false), (10,139,false), (10,147,false), (11,0,false)] {
+                let mut bytes = vec![0; 22];
+                bytes[18..20].copy_from_slice(&if is_le { mode.to_le_bytes() } else { mode.to_be_bytes() });
+                bytes[20..22].copy_from_slice(&if is_le { size.to_le_bytes() } else { size.to_be_bytes() });
+                for typ in [3, 8] {
+                    let mut data = CanonExifData::default();
+                    parse_canon_makernote_entry(0x0001, typ, 11, &bytes, is_le, &mut data);
+                    assert_eq!(data.canon_sraw, expected);
+                }
+                for (typ, count, len) in [(4,11,22), (3,10,22), (3,11,20)] {
+                    let mut data = CanonExifData::default();
+                    parse_canon_makernote_entry(0x0001, typ, count, &bytes[..len], is_le, &mut data);
+                    assert!(!data.canon_sraw);
                 }
             }
         }

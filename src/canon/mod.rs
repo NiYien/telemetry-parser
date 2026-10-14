@@ -12,6 +12,7 @@ mod cndm_tags;
 mod mxf_time;
 use cndm_tags::get_tag;
 pub mod exif;
+mod sraw;
 
 
 /// Whether an APS-C-only lens (EF-S / RF-S) on this body implies a forced sensor crop.
@@ -603,6 +604,14 @@ impl Canon {
             util::insert_tag(map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:.3} fps", v), fps, Vec::new()), options);
             util::insert_tag(map, tag!(parsed GroupId::Default, TagId::RecordFrameRate, "Record frame rate", f64, |v| format!("{:.3} fps", v), record_fps, Vec::new()), options);
         }
+        let canon_sraw = self.is_crm
+            && resolution_w_video == 4096 && resolution_h_video == 2160
+            && exif_data.as_ref().is_some_and(|e| e.from_cmt && e.canon_sraw);
+        if canon_sraw {
+            if let Some(map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
+                util::insert_tag(map, tag!(parsed GroupId::Default, TagId::Custom("canon_sraw".into()), "Canon SRAW", bool, |v| v.to_string(), true, Vec::new()), options);
+            }
+        }
         let canon_fine = exif_data.as_ref().map_or(false, |e| e.canon_fine);
         let canon_movie_crop = exif_data.as_ref().and_then(|e| e.movie_crop);
         let canon_aspect_ratio = exif_data.as_ref().and_then(|e| e.aspect_ratio);
@@ -719,7 +728,13 @@ impl Canon {
                                             _ => (resolution_w_video, resolution_h_video),
                                         }
                                     };
-                                    if let Some(rt) = db.process_readout("CANON", matched_name, readout_w, readout_h, record_fps.unwrap_or(fps), 0.0, sensor_w, &tags, map, options) {
+                                    let readout = if canon_sraw && matched_name == "R5 Mark II" {
+                                        // A missing SRAW preset must not fall back to the ordinary 4K scan.
+                                        sraw::process_readout(&db, matched_name, record_fps.unwrap_or(fps), map, options)
+                                    } else {
+                                        db.process_readout("CANON", matched_name, readout_w, readout_h, record_fps.unwrap_or(fps), 0.0, sensor_w, &tags, map, options)
+                                    };
+                                    if let Some(rt) = readout {
                                         self.frame_readout_time = Some(rt);
                                     }
                                 }
