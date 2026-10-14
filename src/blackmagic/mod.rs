@@ -10,6 +10,8 @@ use crate::tiff_ifd;
 use byteorder::{ ReadBytesExt, LittleEndian, BigEndian };
 use memchr::memmem;
 
+mod sony;
+
 #[derive(Default)]
 pub struct BlackmagicBraw {
     pub model: Option<String>,
@@ -208,10 +210,12 @@ impl BlackmagicBraw {
         // First valid per-frame focal length (35mm-equivalent for Video Assist
         // source-camera BRAW), captured for the source-camera lens synthesis below.
         let mut equiv_focal: Option<f32> = None;
+        let mut sony_metadata = None;
+        let mut sony_first_values = GroupedTagMap::new();
 
         let mut firmware_version = String::new();
         // let mut crop_factor = 1.0;
-        if let Ok(meta) = self.parse_meta(stream, size) {
+        if let Ok(mut meta) = self.parse_meta(stream, size) {
             if let Some(cam) = meta.get("camera_type").and_then(|x| x.as_str()) {
                 self.model = Some(cam.trim_start_matches("Blackmagic ").to_string());
             }
@@ -237,6 +241,18 @@ impl BlackmagicBraw {
             }
             if let Some(v) = meta.get("sensor_area_captured").and_then(|v| v.as_array()).and_then(|x| Some((x.get(0)?.as_f64()? as f32, x.get(1)?.as_f64()? as f32))) {
                 util::insert_tag(&mut map, tag!(parsed GroupId::Imager, TagId::CaptureAreaSize, "Capture area size", f32x2, |v| format!("{v:?}"), v, vec![]), &options);
+            }
+            sony_metadata = sony::Metadata::new(&meta);
+            if let Some(sony) = &sony_metadata {
+                sony.emit_global(&meta, &mut map, &options);
+                if let Some(geometry) = sony.geometry {
+                    meta["focal_projection_estimated"] = true.into();
+                    meta["focal_length_35mm_estimated"] = true.into();
+                    meta["scale_35mm"] = geometry.scale_35mm.into();
+                }
+                // A zero line time in an external recording is missing timing,
+                // not evidence that the source camera has a global shutter.
+                self.frame_readout_time = self.frame_readout_time.filter(|v| v.is_finite() && *v > 0.0);
             }
             match self.model.as_deref() {
                 Some("Pocket Cinema Camera 6K Pro") |
@@ -337,7 +353,13 @@ impl BlackmagicBraw {
             .and_then(|path| crate::camera_db::CameraDatabase::load(path).ok());
         let source_camera = source_db.as_ref().and_then(|db| {
             let brand = Self::source_db_brand(self.original_manufacturer.as_deref()?);
-            let (name, data) = db.process_model(&brand, self.model.as_deref().unwrap_or(""), &mut map, &options)?;
+            let model = self.model.as_deref().unwrap_or("");
+            let model = if sony_metadata.is_some() { sony::lookup_model(model) } else { model };
+            let (name, data) = if sony_metadata.is_some() {
+                db.find_model(&brand, model)?
+            } else {
+                db.process_model(&brand, model, &mut map, &options)?
+            };
             Some((brand, name.to_string(), data.clone()))
         });
         let cap = map.get(&GroupId::Imager)
@@ -371,7 +393,16 @@ impl BlackmagicBraw {
                         frame_rate = v[0].as_u64().zip(v[1].as_u64()).map(|(a, b)| a as f64 / b.max(1) as f64);
                     }
                 }
-                if let Some(v) = md.get("focal_length").and_then(|v| v.as_str()) {
+                if let Some(sony) = &sony_metadata {
+                    sony.emit_frame(&md, &mut map, &options);
+                    // The first sample is a clip summary. Sony consumers read it
+                    // for identification, while the timed samples retain zooms.
+                    for (group, tags) in &map {
+                        for (id, tag) in tags {
+                            sony_first_values.entry(group.clone()).or_default().entry(id.clone()).or_insert_with(|| tag.clone());
+                        }
+                    }
+                } else if let Some(v) = md.get("focal_length").and_then(|v| v.as_str()) {
                     let v = v.replace("mm", "");
                     if let Ok(v) = v.parse::<f32>() {
                         if equiv_focal.is_none() && v > 0.0 { equiv_focal = Some(v); }
@@ -388,6 +419,12 @@ impl BlackmagicBraw {
             }
         }, cancel_flag.clone());
 
+        for (group, tags) in sony_first_values {
+            for (id, tag) in tags {
+                map.entry(group.clone()).or_default().entry(id).or_insert(tag);
+            }
+        }
+
         if let Some(fr) = frame_rate {
             util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::FrameRate, "Frame rate", f64, |v| format!("{:?}", v), fr, vec![]), &options);
             if let Some(rs) = self.frame_readout_time {
@@ -403,7 +440,7 @@ impl BlackmagicBraw {
                 .filter(|pc| *pc > 0 && res_w > 0.0).map(|pc| (pc as f64 * 1.5).sqrt() / res_w);
 
             // Older databases and other source cameras retain their existing focal interpretation.
-            if raw_focal_scale.is_none() {
+            if raw_focal_scale.is_none() && sony_metadata.is_none() {
                 if let Some(scale) = readout_scale {
                     util::insert_tag(&mut map, tag!(parsed GroupId::Default, TagId::Custom("crop_factor".into()), "Crop factor", f64, |v| format!("{v:.4}"), scale, vec![]), &options);
                 }
@@ -420,7 +457,18 @@ impl BlackmagicBraw {
             }
 
             // Readout timing keeps its existing reference; do not substitute the new focal scale.
-            if self.frame_readout_time.map_or(true, |v| v <= 0.0) {
+            if sony_metadata.as_ref().is_some_and(|sony| sony.geometry.is_some())
+                && model_name == "ILCE-FX3"
+                && frame_rate.is_some_and(|fps| fps.is_finite() && (23.0..=60.1).contains(&fps))
+                && self.frame_readout_time.is_none() {
+                if let Some(db) = source_db.as_ref() {
+                    // A recorded line time wins. Older packages without an explicit RAW
+                    // entry must not silently borrow a confirmed internal-video value.
+                    self.frame_readout_time = db.process_readout_resolution_override(
+                        &brand, &model_name, 4240, 2392, &mut map, &options);
+                }
+            }
+            if sony_metadata.is_none() && self.frame_readout_time.map_or(true, |v| v <= 0.0) {
                 if let Some(db) = source_db.as_ref() {
                     let tags = std::collections::HashMap::new();
                     let res_h = cap.map(|v| v.1.round() as u32).unwrap_or(0);

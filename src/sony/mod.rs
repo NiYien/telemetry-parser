@@ -6,6 +6,7 @@ pub mod rtmd_tags;
 mod upstream_port_tests;
 pub mod mxf;
 pub mod lens_profile;
+mod readout;
 
 #[cfg(feature="sony-xml")]
 pub mod xml_metadata;
@@ -235,6 +236,7 @@ impl Sony {
                 self.process_case2_json_fallback(samples, options, video_md);
             }
         }
+        self.process_fx3_readout_fallback(samples, options, video_md);
     }
 
     /// Case 0: RTMD has a positive physical focal length.
@@ -444,7 +446,7 @@ impl Sony {
                     }
 
                     // Readout fallback
-                    if self.frame_readout_time.is_none() {
+                    if self.frame_readout_time.is_none() && matched_name != "ILCE-FX3" {
                         if let Some(rt) = db.process_readout("SONY", matched_name, resolution_w, resolution_h, fps, 0.0, sensor_w, &tags, map, options) {
                             self.frame_readout_time = Some(rt);
                         }

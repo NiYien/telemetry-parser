@@ -281,8 +281,8 @@ impl CameraDatabase {
                     if tag_is_true {
                         if let Some(val) = find_additional_value(&additional, pattern) {
                             return Some(ReadoutResult {
-                                readout_time_ms: val,
-                                is_estimated: false,
+                                readout_time_ms: val.abs(),
+                                is_estimated: val < 0.0,
                             });
                         }
                     }
@@ -290,8 +290,8 @@ impl CameraDatabase {
                 ReadoutAdjustStep::OverrideRes { pattern } => {
                     if let Some(val) = find_additional_res_match(&additional, pattern, res_w, res_h) {
                         return Some(ReadoutResult {
-                            readout_time_ms: val,
-                            is_estimated: false,
+                            readout_time_ms: val.abs(),
+                            is_estimated: val < 0.0,
                         });
                     }
                 }
@@ -409,15 +409,31 @@ impl CameraDatabase {
         self.process_readout_subsampled(brand, model, res_w, res_h, fps, scale_35mm, sensor_w, None, tags, map, options)
     }
 
+    /// Read an explicit resolution override without borrowing a video-class fallback.
+    /// External RAW readers use this when an older database has no RAW timing entry.
+    pub fn process_readout_resolution_override(&self, brand: &str, model: &str, res_w: u32, res_h: u32, map: &mut crate::tags_impl::GroupedTagMap, options: &crate::InputOptions) -> Option<f64> {
+        let brand = self.brands.get(&brand.to_uppercase())?;
+        let additional = brand.readout.additional.get(model)?;
+        let value = brand.readout_adjust.iter().find_map(|step| match step {
+            ReadoutAdjustStep::OverrideRes { pattern } => find_additional_res_match(additional, pattern, res_w, res_h),
+            _ => None,
+        }).filter(|v| v.is_finite() && *v != 0.0)?;
+        Some(Self::write_readout_result(ReadoutResult { readout_time_ms: value.abs(), is_estimated: value < 0.0 }, map, options))
+    }
+
     /// `process_readout` variant for N-RAW captures carrying a subsampled-scan ratio
     /// (readout lines / crop-area lines). See `lookup_readout` for the ratio semantics.
     pub fn process_readout_subsampled(&self, brand: &str, model: &str, res_w: u32, res_h: u32, fps: f64, scale_35mm: f64, sensor_w: f32, nraw_subsampled_ratio: Option<f64>, tags: &HashMap<String, serde_json::Value>, map: &mut crate::tags_impl::GroupedTagMap, options: &crate::InputOptions) -> Option<f64> {
         let result = self.lookup_readout(brand, model, res_w, res_h, fps, scale_35mm, sensor_w, nraw_subsampled_ratio, tags)?;
+        Some(Self::write_readout_result(result, map, options))
+    }
+
+    fn write_readout_result(result: ReadoutResult, map: &mut crate::tags_impl::GroupedTagMap, options: &crate::InputOptions) -> f64 {
         util::insert_tag(map, crate::tag!(parsed crate::tags_impl::GroupId::Imager, crate::tags_impl::TagId::FrameReadoutTime, "Frame readout time", f64, |v| format!("{:.4} ms", v), result.readout_time_ms, Vec::new()), options);
         if result.is_estimated {
             util::insert_tag(map, crate::tag!(parsed crate::tags_impl::GroupId::Imager, crate::tags_impl::TagId::Custom("readout_estimated".into()), "Readout time estimated", bool, |v| v.to_string(), true, Vec::new()), options);
         }
-        Some(result.readout_time_ms)
+        result.readout_time_ms
     }
 }
 
@@ -874,6 +890,32 @@ fn parse_readout_adjust_step(json: &serde_json::Value) -> Result<ReadoutAdjustSt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::InputOptions;
+
+    #[test]
+    fn signed_readout_overrides_keep_estimates_positive_and_exact_only_lookup_does_not_fallback() {
+        let brand = parse_brand(&serde_json::json!({
+            "models":{"TEST":{"sw":36.0}},
+            "readout":{"columns":["4K60"],"data":{"TEST":[8.0]},
+                "additional":{"TEST":["RES:4240:2392:-9.2","RES:4096:2160:7.5","SLOW:-4.15"]}},
+            "readout_adjust":[{"type":"override_res","pattern": "RES:"},{"type":"override","pattern": "SLOW:","when_tag":"slow"}]
+        })).unwrap();
+        let db = CameraDatabase { brands: [("SONY".into(),brand)].into() };
+        for (w,h,value,estimated,tags) in [
+            (4240,2392,9.2,true,HashMap::new()),
+            (4096,2160,7.5,false,HashMap::new()),
+            (3840,2160,4.15,true,[("slow".into(),true.into())].into()),
+        ] {
+            let result = db.lookup_readout("SONY","TEST",w,h,50.0,0.0,36.0,None,&tags).unwrap();
+            assert_eq!(result.readout_time_ms,value);
+            assert_eq!(result.is_estimated,estimated);
+        }
+        let mut map = GroupedTagMap::new();
+        assert_eq!(db.process_readout_resolution_override("SONY","TEST",3840,2160,&mut map,&InputOptions::default()),None);
+        assert!(map.is_empty());
+        assert_eq!(db.process_readout_resolution_override("SONY","TEST",4240,2392,&mut map,&InputOptions::default()),Some(9.2));
+        assert_eq!(map[&GroupId::Imager].get_t(TagId::Custom("readout_estimated".into())) as Option<&bool>,Some(&true));
+    }
 
     #[test]
     fn test_resolve_columns() {
