@@ -479,6 +479,31 @@ fn embedded_brand_detects_mov_without_a_prores_signature() {
 }
 
 #[test]
+fn vista_dispatch_survives_panasonic_payload_strings_and_an_unconfirmed_brand() {
+    let db = vista_db();
+    for brand in [b"qt  ", b"pana"] {
+        let mut ftyp = brand.to_vec();
+        ftyp.extend([0; 4]);
+        let mut bytes = atom(b"ftyp", &ftyp);
+        bytes.extend(atom(b"mdat", b"Panasonic PANA pana"));
+        bytes.extend(atom(b"moov", &meta(&[
+            ("com.apple.quicktime.make", "Kinefinity"),
+            ("com.apple.quicktime.model", "VISTA"),
+            ("com.kinefinity.width", "6016"),
+            ("com.kinefinity.height", "3984"),
+            ("com.kinefinity.sensor_fps", "30"),
+        ], false)));
+        let mut options = db.options();
+        options.dont_look_for_sidecar_files = true;
+        let input = Input::from_stream_with_options(&mut std::io::Cursor::new(&bytes),
+            bytes.len(), "video.mov", |_| (), Arc::new(AtomicBool::new(false)), options).unwrap();
+        assert_eq!(input.camera_type(), "Kinefinity", "brand={brand:?}");
+        assert_eq!(input.camera_model().map(String::as_str), Some("VISTA"));
+        assert_eq!(input.frame_readout_time(), Some(18.0));
+    }
+}
+
+#[test]
 #[ignore = "Set KINEFINITY_CAMERA_DB to validate the authoritative data package"]
 fn authoritative_database_modes() {
     let path = std::env::var("KINEFINITY_CAMERA_DB").unwrap();

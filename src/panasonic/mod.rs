@@ -56,19 +56,37 @@ impl Panasonic {
     }
 
     pub fn detect<P: AsRef<std::path::Path>>(buffer: &[u8], _filepath: P, _options: &crate::InputOptions) -> Option<Self> {
+        // Probe buffers include encoded media. Require a complete EXIF box, not a raw string.
         // The D-LUX Typ 109 stores the same EXIF fields in a LEIC box.
-        let leica = memmem::find_iter(buffer, b"LEIC").any(|pos| {
-            let Some(start) = pos.checked_sub(4) else { return false; };
-            let size = u32::from_be_bytes(buffer[start..pos].try_into().unwrap()) as usize;
-            let Some(end) = start.checked_add(size).filter(|end| size >= 8 && *end <= buffer.len()) else { return false; };
-            extract_leica_exif(&buffer[pos + 4..end]).is_some()
+        let boxed_exif = [b"PANA", b"LEIC"].iter().any(|kind| {
+            memmem::find_iter(buffer, kind).any(|pos| {
+                let Some(start) = pos.checked_sub(4) else { return false; };
+                let Ok((_, _, size, header_size)) = util::read_box(&mut Cursor::new(&buffer[start..])) else { return false; };
+                let Ok(size) = usize::try_from(size) else { return false; };
+                let Some(end) = start.checked_add(size)
+                    .filter(|end| size >= header_size as usize && *end <= buffer.len()) else { return false; };
+                let data = &buffer[start + header_size as usize..end];
+                if *kind == b"LEIC" {
+                    extract_leica_exif(data).is_some()
+                } else {
+                    extract_exif_from_pana(data).is_some()
+                }
+            })
         });
-        // Detect via: "Panasonic" string, "PANA" atom, or "pana" ftyp compatible brand
-        if memmem::find(buffer, b"Panasonic").is_some()
-            || memmem::find(buffer, b"PANA").is_some()
-            || (memmem::find(buffer, b"ftyp").is_some() && memmem::find(buffer, b"pana").is_some())
-            || leica
-        {
+        // A brand belongs to the top-level ftyp box, outside its minor-version field.
+        let mut cursor = Cursor::new(buffer);
+        let pana_brand = loop {
+            let Ok((typ, offset, size, header_size)) = util::read_box(&mut cursor) else { break false; };
+            let Some(end) = offset.checked_add(size)
+                .filter(|end| size >= header_size as u64 && *end <= buffer.len() as u64) else { break false; };
+            if typ == util::fourcc("ftyp") {
+                let data = &buffer[(offset + header_size as u64) as usize..end as usize];
+                break data.len() >= 8 && data.len() % 4 == 0 && (&data[..4] == b"pana"
+                    || data[8..].chunks_exact(4).any(|brand| brand == b"pana"));
+            }
+            cursor.set_position(end);
+        };
+        if boxed_exif || pana_brand {
             return Some(Self {
                 model: None,
                 lens: None,
@@ -85,7 +103,7 @@ impl Panasonic {
 
         // Parse PANA atom from moov/udta
         stream.seek(SeekFrom::Start(0))?;
-        let exif_data = self.parse_mov(stream, size).unwrap_or_default();
+        let exif_data = self.parse_mov(stream, size)?;
 
         // Get video track metadata (resolution, fps)
         stream.seek(SeekFrom::Start(0))?;

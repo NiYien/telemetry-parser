@@ -177,3 +177,105 @@ fn file_metadata_survives_missing_or_unmatched_camera_database() {
     assert!(!map[&GroupId::Default].contains_key(&TagId::Name));
     assert!(!map[&GroupId::Default].contains_key(&TagId::ImageStabilizer));
 }
+
+#[test]
+fn detection_ignores_panasonic_strings_in_media_payload() {
+    let nested_ftyp = atom(b"ftyp", b"pana\0\0\0\0pana");
+    for payload in [b"Panasonic".as_slice(), b"PANA", b"pana", nested_ftyp.as_slice()] {
+        let mut bytes = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+        bytes.extend(atom(b"mdat", payload));
+        assert!(Panasonic::detect(&bytes, "video.mov", &InputOptions::default()).is_none());
+    }
+}
+
+#[test]
+fn detection_requires_a_panasonic_ftyp_brand_field() {
+    for payload in [b"pana\0\0\0\0qt  ".as_slice(), b"qt  \0\0\0\0pana"] {
+        let bytes = atom(b"ftyp", payload);
+        assert!(Panasonic::detect(&bytes, "video.mov", &InputOptions::default()).is_some());
+    }
+    for payload in [b"qt  panaqt  ".as_slice(), b"qt  \0\0\0\0xpana___", b"pana", b"pana\0\0\0\0x"] {
+        let bytes = atom(b"ftyp", payload);
+        assert!(Panasonic::detect(&bytes, "video.mov", &InputOptions::default()).is_none());
+    }
+    let bytes = atom(b"ftyp", b"qt  \0\0\0\0pana");
+    for end in 0..bytes.len() {
+        assert!(Panasonic::detect(&bytes[..end], "video.mov", &InputOptions::default()).is_none());
+    }
+}
+
+#[test]
+fn detection_accepts_extended_box_headers() {
+    for (kind, payload) in [(b"ftyp", b"pana\0\0\0\0".to_vec()),
+        (b"PANA", tiff("DC-S5", 350, 35))] {
+        let mut bytes = 1u32.to_be_bytes().to_vec();
+        bytes.extend(kind);
+        bytes.extend(((payload.len() + 16) as u64).to_be_bytes());
+        bytes.extend(payload);
+        assert!(Panasonic::detect(&bytes, "video.mov", &InputOptions::default()).is_some());
+    }
+}
+
+#[test]
+fn detection_requires_a_complete_pana_exif_box() {
+    let bytes = atom(b"PANA", &tiff("DC-S5", 350, 35));
+    assert!(Panasonic::detect(&bytes, "video.mov", &InputOptions::default()).is_some());
+    assert!(Panasonic::detect(&bytes[..bytes.len() - 1], "video.mov", &InputOptions::default()).is_none());
+    assert!(Panasonic::detect(&atom(b"PANA", b"invalid EXIF"), "video.mov", &InputOptions::default()).is_none());
+}
+
+#[test]
+fn parse_rejects_missing_or_invalid_panasonic_exif() {
+    for metadata in [Vec::new(), atom(b"PANA", b"invalid EXIF")] {
+        let mut bytes = atom(b"ftyp", b"pana\0\0\0\0pana");
+        bytes.extend(atom(b"moov", &atom(b"udta", &metadata)));
+        let mut parser = Panasonic::detect(&bytes, "video.mov", &InputOptions::default()).unwrap();
+        assert!(parser.parse(&mut Cursor::new(&bytes), bytes.len(), |_| (),
+            Arc::new(AtomicBool::new(false)), InputOptions::default()).is_err());
+    }
+}
+
+#[test]
+fn full_dispatch_preserves_panasonic_and_dlux_file_metadata() {
+    for (kind, model) in [(b"PANA", "DC-S5"), (b"LEIC", "D-LUX (Typ 109)")] {
+        let mut bytes = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+        bytes.extend(atom(b"moov", &atom(b"udta", &atom(kind, &tiff(model, 350, 35)))));
+        let input = Input::from_stream_with_options(&mut Cursor::new(&bytes), bytes.len(),
+            "video.mov", |_| (), Arc::new(AtomicBool::new(false)), InputOptions {
+                dont_look_for_sidecar_files: true, ..Default::default()
+            }).unwrap();
+        assert_eq!(input.camera_type(), "Panasonic");
+        assert_eq!(input.camera_model().map(String::as_str), Some(model));
+        let map = input.samples.as_ref().unwrap()[0].tag_map.as_ref().unwrap();
+        let lens = &map[&GroupId::Lens];
+        assert_eq!(GetWithType::<f32>::get_t(lens, TagId::FocalLength), Some(&35.0));
+        assert_eq!(GetWithType::<f64>::get_t(&map[&GroupId::Default],
+            TagId::Custom("scale_35mm".into())), Some(&1.0));
+    }
+}
+
+#[test]
+#[ignore = "Set PANASONIC_SAMPLE_DIR to the Panasonic sample directory"]
+fn real_panasonic_samples_preserve_metadata() {
+    let root = std::path::PathBuf::from(std::env::var("PANASONIC_SAMPLE_DIR").unwrap());
+    for name in ["G100.MP4", "GH5M2.MOV", "GX85.mp4", "LX10.MP4", "S5.MOV", "S52X.MOV",
+        "crop/APSC.MOV", "crop/FULL.MOV", "crop/PIXEL.MOV", "gh5s.MOV"] {
+        let path = root.join(name);
+        let mut stream = std::fs::File::open(&path).unwrap();
+        let size = stream.metadata().unwrap().len() as usize;
+        let input = Input::from_stream_with_options(&mut stream, size, &path, |_| (),
+            Arc::new(AtomicBool::new(false)), InputOptions {
+                dont_look_for_sidecar_files: true, ..Default::default()
+            }).unwrap();
+        assert_eq!(input.camera_type(), "Panasonic", "{name}");
+        assert!(input.camera_model().is_some_and(|model| !model.is_empty()), "{name}");
+        let samples = input.samples.as_ref().unwrap();
+        assert_eq!(samples.len(), 1, "{name}");
+        let tags = samples[0].tag_map.as_ref().unwrap().iter().map(|(group, tags)| {
+            (group, tags.iter().map(|(id, tag)| (id, &tag.value))
+                .collect::<std::collections::BTreeMap<_, _>>())
+        }).collect::<std::collections::BTreeMap<_, _>>();
+        println!("PANASONIC_SAMPLE {name} model={:?} tags={}", input.camera_model(),
+            serde_json::to_string(&tags).unwrap());
+    }
+}
