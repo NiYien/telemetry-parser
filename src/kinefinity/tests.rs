@@ -622,3 +622,177 @@ fn real_vista_sample() {
         additional
     );
 }
+
+#[test]
+fn mavo_lf_slate_ff_and_dimensions_resolve_oversampling_without_a_flag() {
+    let db = TestDb::new(json!({"models":{"MAVO LF":{"sw":36,"kinefinity":{
+        "sensor_size":[6016,4016],
+        "native_format":"FULL",
+        "oversampling":[{"format":"FULL","output":[2944,2000],"source":[5888,3984]}],
+        "readout":[{"format":"FULL","height":3172,"ms":-17}]
+    }}}}));
+    let data = parse_slate_content(concat!(
+        "# SLATE.TXT Revision 2.0\nCamera Model........: MAVO LF\n",
+        "Image Format........: FF\nWidth...............: 2944\nHeight..............: 2000\n",
+        "Sensor FPS..........: 48\nProject FPS.........: 48\nFocal Length........: N/A\n"
+    )).unwrap();
+    assert_eq!(data.oversampling, None);
+    let mut options = db.options();
+    options.user_focal_length = Some(50.0);
+    let mut camera = Kinefinity::default();
+    let mut map = GroupedTagMap::new();
+    camera.process_map(&mut map, &options, None, &data);
+    let additional: &serde_json::Value = map[&GroupId::Default].get_t(TagId::Metadata).unwrap();
+    assert_eq!(additional["image_format"], "FULL");
+    assert_eq!(additional["oversampling"], true);
+    assert_eq!(additional["kinefinity_source_size"], json!([5888,3984]));
+    assert_eq!(additional["readout_estimated"], true);
+    let upfl: &f64 = map[&GroupId::Lens].get_t(TagId::Custom("unit_pixel_focal_length".into())).unwrap();
+    assert!((*upfl - 6016.0 / 72.0).abs() < 1e-9);
+    assert!((camera.frame_readout_time.unwrap() - 17.0 * 3984.0 / 3172.0).abs() < 1e-9);
+    let db = db.load();
+    for format in ["FF", "Full Frame", "FULL", "ff"] {
+        let g = resolve_camera_geometry(&db, "MAVO LF", (2944,2000), 48.0, Some(format), None).unwrap();
+        assert!(g.oversampling);
+        assert_eq!(g.source_size, Some((5888,3984)));
+    }
+    assert!(resolve_camera_geometry(&db, "MAVO LF", (2944,2000), 48.0, None, None).is_none());
+    let native = resolve_camera_geometry(&db, "MAVO LF", (2944,2000), 48.0, Some("FF"), Some(false)).unwrap();
+    assert!(!native.oversampling);
+    assert_eq!(native.source_size, Some((2944,2000)));
+    assert!((native.unit_pixel_focal_length / *upfl - 2.0).abs() < 1e-9);
+}
+
+#[test]
+#[ignore = "Set KINEFINITY_CAMERA_DB to validate legacy and M43 coverage"]
+fn authoritative_legacy_and_m43_modes_require_matching_format() {
+    let db = crate::camera_db::CameraDatabase::load(&std::env::var("KINEFINITY_CAMERA_DB").unwrap()).unwrap();
+    let cases = [
+        ("MAVO LF", "FF", (3840,2672), (5760,3984)),
+        ("MAVO LF", "FF", (2944,2000), (5888,3984)),
+        ("MAVO", "S35", (3840,2672), (5760,3984)),
+        ("MAVO", "S35", (2944,2000), (5888,3984)),
+        ("MAVO Edge 6K", "FF", (3840,2672), (5760,3984)),
+        ("MAVO Edge 6K", "FF", (2944,2000), (5888,3984)),
+        ("MAVO Edge 6K", "FF", (2944,1620), (5888,3240)),
+        ("MAVO Edge 6K", "FF", (2944,1200), (5888,2400)),
+        ("MAVO mark2 S35", "M4/3", (2048,1080), (4096,2160)),
+        ("MAVO mark2 S35", "M4/3", (2048,832), (4096,1672)),
+        ("MAVO mark2 S35", "M4/3", (1920,1080), (3840,2160)),
+        ("MAVO mark2 S35", "M4/3", (1920,784), (3840,1576)),
+    ];
+    for (model, format, output, source) in cases {
+        for flag in [None, Some(true)] {
+            let g = resolve_camera_geometry(&db, model, output, 48.0, Some(format), flag).unwrap();
+            assert!(g.oversampling, "{model} {format} {output:?}");
+            assert_eq!(g.source_size, Some(source), "{model} {format} {output:?}");
+        }
+        assert!(resolve_camera_geometry(&db, model, output, 48.0, None, None).is_none(), "{model} {output:?}");
+        let native = resolve_camera_geometry(&db, model, output, 48.0, Some(format), Some(false)).unwrap();
+        assert_eq!(native.source_size, Some(output));
+        assert!(!native.oversampling);
+        if format == "M4/3" {
+            let s16 = resolve_camera_geometry(&db, model, output, 48.0, Some("S16"), None).unwrap();
+            assert!(!s16.oversampling);
+            assert_eq!(s16.source_size, Some(output));
+            assert!((s16.unit_pixel_focal_length / native.unit_pixel_focal_length - 1.0).abs() < 1e-9);
+        }
+    }
+    let ff = resolve_camera_geometry(&db, "MAVO Edge 6K", (2944,1620), 48.0, Some("FF"), None).unwrap();
+    let m43 = resolve_camera_geometry(&db, "MAVO Edge 6K", (2944,1620), 48.0, Some("M43"), None).unwrap();
+    assert_eq!(m43.source_size, Some((2944,1620)));
+    assert!(m43.unit_pixel_focal_length > ff.unit_pixel_focal_length * 1.99);
+    let mavo = resolve_camera_geometry(&db, "MAVO", (2944,2000), 48.0, Some("S35"), None).unwrap();
+    assert!(mavo.readout.is_none());
+}
+
+#[test]
+#[ignore = "Set KINEFINITY_MAVO_SAMPLES and KINEFINITY_CAMERA_DB to the original FF 3K clips"]
+fn real_mavo_lf_ff_samples_use_matching_slates() {
+    let folder = std::env::var("KINEFINITY_MAVO_SAMPLES").unwrap();
+    let database = std::env::var("KINEFINITY_CAMERA_DB").unwrap();
+    for clip in ["PRJ-0004-311-A1-DCD6", "PRJ-0004-338-A1-E153", "PRJ-0004-345-A1-E4E7", "PRJ-0004-356-A1-E64C"] {
+        let path = std::path::Path::new(&folder).join(format!("{clip}.mov"));
+        let filename = path.to_string_lossy().replace('\\', "/");
+        for sidecars in [true, false] {
+            let mut stream = std::fs::File::open(&path).unwrap();
+            let size = stream.metadata().unwrap().len() as usize;
+            let input = Input::from_stream_with_options(&mut stream, size, &filename, |_| (),
+                Arc::new(AtomicBool::new(false)), InputOptions {
+                    camera_db_path: Some(database.clone()),
+                    dont_look_for_sidecar_files: !sidecars,
+                    ..Default::default()
+                }).unwrap();
+            assert_eq!(input.camera_type(), "Kinefinity");
+            let map = input.samples.as_ref().unwrap()[0].tag_map.as_ref().unwrap();
+            let additional: &serde_json::Value = map[&GroupId::Default].get_t(TagId::Metadata).unwrap();
+            if sidecars {
+                assert_eq!(input.camera_model().map(String::as_str), Some("MAVO LF"));
+                assert_eq!(additional["image_format"], "FULL");
+                assert_eq!(additional["oversampling"], true);
+                assert_eq!(additional["kinefinity_source_size"], json!([5888,3984]));
+                assert_eq!(additional["readout_estimated"], true);
+                assert!((input.frame_readout_time().unwrap() - 20.0).abs() < 1e-9);
+                let upfl: &f64 = map[&GroupId::Lens].get_t(TagId::Custom("unit_pixel_focal_length".into())).unwrap();
+                assert!((*upfl - 6016.0 / 72.0).abs() < 1e-9);
+                let focal: Option<&f32> = map[&GroupId::Lens].get_t(TagId::FocalLength);
+                assert!(focal.is_none());
+                println!("{clip}: source=5888x3984, upfl={upfl}, readout={:?}, estimated=true", input.frame_readout_time());
+            } else {
+                assert!(input.frame_readout_time().is_none());
+                assert!(additional.get("oversampling").is_none());
+                assert!(additional.get("kinefinity_source_size").is_none());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "Set KINEFINITY_CAMERA_DB to verify sensor scan timing across output modes"]
+fn authoritative_readout_follows_scan_mode_instead_of_encoded_size() {
+    let db = crate::camera_db::CameraDatabase::load(&std::env::var("KINEFINITY_CAMERA_DB").unwrap()).unwrap();
+    let geometry = |model, size, fps, format, over| {
+        resolve_camera_geometry(&db, model, size, fps, Some(format), over).unwrap()
+    };
+    let time = |g: &CameraGeometry| g.readout.as_ref().unwrap().readout_time_ms;
+
+    // Identical encoded frames can use different sensor regions and row-time references.
+    let full = geometry("MAVO Edge 6K", (3840,2160), 48.0, "FF", None);
+    let s35 = geometry("MAVO Edge 6K", (3840,2160), 48.0, "S35", None);
+    assert_eq!(full.source_size, Some((5760,3240)));
+    assert_eq!(s35.source_size, Some((3840,2160)));
+    assert!((time(&full) - 20.7 * 3240.0 / 3984.0).abs() < 1e-9);
+    assert_eq!(time(&s35), 12.0);
+    assert!((time(&full) / time(&s35) - 1.5).abs() > 0.05);
+
+    // Downsampling an unchanged sensor scan does not shorten its rolling shutter time.
+    let full_4k = geometry("MAVO LF", (3840,2160), 48.0, "FF", None);
+    let native_6k = geometry("MAVO LF", (5760,3240), 48.0, "FF", Some(false));
+    assert_eq!(full_4k.source_size, native_6k.source_size);
+    assert_eq!(time(&full_4k), time(&native_6k));
+    let oversampled = geometry("MAVO LF", (2944,2000), 48.0, "FF", None);
+    let forced_crop = geometry("MAVO LF", (2944,2000), 48.0, "FF", Some(false));
+    assert_eq!(time(&oversampled), 20.0);
+    assert!((time(&forced_crop) - 20.0 * 2000.0 / 3984.0).abs() < 1e-9);
+    assert!((time(&oversampled) / time(&forced_crop) - 3984.0 / 2000.0).abs() < 1e-9);
+    assert!(time(&oversampled) < 1000.0 / 48.0);
+    assert!(oversampled.readout.as_ref().unwrap().is_estimated);
+
+    // Native crops use the full scan's row time within the ordinary readout class.
+    for (format, size) in [("S35", (4096,2160)), ("M43", (2944,1620)), ("S16", (1920,1080))] {
+        let crop = geometry("MAVO LF", size, 48.0, format, None);
+        assert_eq!(crop.source_size, Some(size));
+        assert!(!crop.oversampling);
+        assert!((time(&crop) - 20.0 * size.1 as f64 / 3984.0).abs() < 1e-9);
+        assert!(crop.readout.as_ref().unwrap().is_estimated);
+    }
+    // Do not infer a faster row clock or apply the rule to an unrecognized image format.
+    let unknown_crop = geometry("MAVO LF", (2944,1620), 120.0, "M43", Some(false));
+    assert!(unknown_crop.readout.is_none());
+    let unknown_format = geometry("MAVO LF", (2944,1620), 48.0, "UNKNOWN", Some(false));
+    assert!(unknown_format.readout.is_none());
+    let fast_s35 = geometry("MAVO Edge 6K", (3840,2160), 120.0, "S35", Some(false));
+    assert!(fast_s35.readout.is_none());
+    println!("Edge 6K UHD: FULL oversampling={:.6}ms, native S35={:.6}ms; MAVO LF UHD oversampling and native 6K share {:.6}ms; 3K OG={:.6}ms; forced native crop={:.6}ms",
+        time(&full), time(&s35), time(&full_4k), time(&oversampled), time(&forced_crop));
+}
