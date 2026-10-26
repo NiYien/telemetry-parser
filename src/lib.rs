@@ -38,6 +38,9 @@ pub mod tags_impl;
 pub mod util;
 pub mod filesystem;
 
+#[cfg(test)]
+mod parsing_fixes_tests;
+
 use std::io::*;
 use std::sync::{ Arc, atomic::AtomicBool };
 use std::collections::HashSet;
