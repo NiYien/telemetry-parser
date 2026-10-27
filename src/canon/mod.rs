@@ -94,6 +94,9 @@ pub struct Canon {
     frame_readout_time: Option<f64>,
     mvhd_creation_time: Option<String>,
 }
+
+#[cfg(test)]
+mod sparse_indices_tests;
 impl Canon {
     pub fn camera_type(&self) -> String {
         "Canon".to_owned()
@@ -237,7 +240,7 @@ impl Canon {
                     options.metadata_sample_stride, if probe_has_gyro { "1".to_string() } else { format!("{:?}", options.metadata_sample_stride) });
                 if probe_has_gyro { Some(1) } else { options.metadata_sample_stride }
             };
-            let _strided_result = util::get_metadata_track_samples_strided(stream, size, true, effective_stride, |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
+            let _strided_result = util::get_metadata_track_samples_strided_indexed(stream, size, true, effective_stride, |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
                 if size > 0 {
                     progress_cb(file_position as f64 / size as f64);
                 }

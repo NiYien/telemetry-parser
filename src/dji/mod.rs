@@ -15,6 +15,34 @@ use memchr::memmem;
 use prost::Message;
 
 mod csv;
+pub(crate) mod timing;
+use timing::HeldQuaternions;
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct HeaderProbe {
+    #[prost(message, optional, tag = "1")]
+    clip_meta: Option<ClipMetaProbe>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ClipMetaProbe {
+    #[prost(message, optional, tag = "1")]
+    clip_meta_header: Option<ClipMetaHeaderProbe>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ClipMetaHeaderProbe {
+    #[prost(string, tag = "1")]
+    proto_file_name: String,
+    #[prost(string, tag = "10")]
+    product_name: String,
+}
+
+pub(crate) fn video_frame_rate(ctx: &mp4parse::MediaContext) -> Option<f64> {
+    let track = ctx.tracks.iter().find(|x| x.track_type == mp4parse::TrackType::Video)?;
+    let timescale = track.timescale?.0;
+    let table: Vec<(u32, u32)> = track.stts.as_ref()?.samples.iter().map(|s| (s.sample_count, s.sample_delta)).collect();
+    let duration = timing::frame_duration(&table)?;
+    (timescale > 0).then(|| timescale as f64 / duration)
+}
 
 #[derive(Default)]
 pub struct Dji {
@@ -69,18 +97,17 @@ impl Dji {
         }
 
         let mut samples = Vec::new();
-        let mut first_timestamp = 0;
+        let mut first_timestamp: Option<(i64, f64)> = None;
+        let mut frames = Vec::new();
+        let mut held_quaternions = Vec::new();
+        let mut stated_sensor_fps = None;
 
         let mut focal_length = None;
         let mut distortion_coeffs = None;
-        let mut exposure_time = 0.0;
-        let mut fps = 59.94;
-        let mut sensor_fps = 59.969295501708984;
-        let mut sample_rate = 2000.0;
-        // let mut global_quat_i = 0;
+                let mut fps = 59.94;
+                // let mut global_quat_i = 0;
 
         // let mut first_vsync = 0;
-        let mut prev_ts = 0.0;
         let mut prev_quat: Option<Quaternion<f64>> = None;
         let mut inv = false;
 
@@ -93,13 +120,11 @@ impl Dji {
             }
 
             if which_proto == DeviceProtobuf::Unknown {
-                if data.len() > 64 && memmem::find(&data[0..64], b"oq101").is_some() {
-                    which_proto = DeviceProtobuf::Oq101;
-                } else if data.len() > 64 && (memmem::find(&data[0..64], b"WA530").is_some() || memmem::find(&data[0..64], b"wa530").is_some()) {
-                    which_proto = DeviceProtobuf::Wa530;
-                } else {
-                    which_proto = DeviceProtobuf::Wm169;
-                }
+                let header = HeaderProbe::decode(data).ok().and_then(|h| h.clip_meta?.clip_meta_header).unwrap_or_default();
+                let product = format!("{} {}", header.proto_file_name, header.product_name).to_ascii_lowercase();
+                which_proto = if product.contains("oq101") { DeviceProtobuf::Oq101 }
+                    else if product.contains("wa530") { DeviceProtobuf::Wa530 }
+                    else { DeviceProtobuf::Wm169 };
                 log::debug!("Using device protobuf: {which_proto:?}");
             }
 
@@ -114,10 +139,7 @@ impl Dji {
                         distortion_coeffs       = clip.distortion_coefficients.as_ref().map(|h| h.coeffients.clone());
 
                         if let Some(v) = clip.sensor_fps.as_ref().map(|h| h.sensor_frame_rate as f64) {
-                            sensor_fps = v;
-                        }
-                        if let Some(v) = clip.imu_sampling_rate.as_ref().map(|h| h.imu_sampling_rate as f64) {
-                            sample_rate = v;
+                            stated_sensor_fps = Some(v);
                         }
 
                         let v = serde_json::to_value(&clip).map_err(|_| Error::new(ErrorKind::Other, "Serialize error"));
@@ -130,111 +152,27 @@ impl Dji {
                                 fps = meta.framerate as f64;
                             }
                         }
-                        if let Some(ref mut v) = self.frame_readout_time {
-                            *v /= fps / sensor_fps;
-                        }
                     }
 
-                    let fps_ratio = fps / sensor_fps;
-
-                    let mut quats = Vec::new();
-                    if let Some(ref frame) = $parsed.frame_meta {
-                        let frame_ts = frame.frame_meta_header.as_ref().unwrap().frame_timestamp as i64;
-                        if info.sample_index == 0 { first_timestamp = frame_ts; }
-                        let frame_relative_ts = frame_ts - first_timestamp;
-
-                        if let Some(ref e) = frame.camera_frame_meta {
-                            exposure_time = e.exposure_time.as_ref().and_then(|v| Some(*v.exposure_time.get(0)? as f64 / *v.exposure_time.get(1)? as f64)).unwrap_or_default() * 1000.0;
-
-                            // log::debug!("Exposure time: {:?}", &exposure_time);
-                        }
-
+                    if let Some((frame, header)) = $parsed.frame_meta.as_ref().and_then(|frame| Some((frame, frame.frame_meta_header.as_ref()?))) {
+                        let frame_ts = header.frame_timestamp as i64;
+                        let (first_frame_ts, _) = *first_timestamp.get_or_insert((frame_ts, info.timestamp_ms));
+                        let frame_relative_ts = frame_ts - first_frame_ts;
+                        frames.push(timing::Frame { sample: info.sample_index, ms: info.timestamp_ms, us: frame_relative_ts });
                         if let Some(ref imu) = frame.imu_frame_meta {
                             if let Some(attitude) = imu.$field.as_ref()$(.and_then(|m| m.$sub.as_ref()))? {
-                                // let ts = attitude.timestamp as i64;
-                                // println!("{} {} {} {}, vsync: {}", frame_ts, ts, frame_relative_ts, ts - frame_ts, attitude.vsync);
                                 let len = attitude.attitude.len() as f64;
-
-                                let vsync_duration = 1000.0 / sensor_fps.max(1.0);
-                                // if first_vsync == 0 {
-                                //     first_vsync = attitude.vsync;
-                                // }
-
-                                let frame_timestamp = (frame_relative_ts as f64) / 1000.0;
-
-                                // let frame_timestamp = (attitude.vsync - first_vsync) as f64 * vsync_duration;
-                                // println!("fps: {fps}, sensor_fps: {sensor_fps}, ratio: {fps_ratio}, exp: {exposure_time}, ts: {frame_timestamp}, diff: {}", frame_timestamp);
-                                // println!("vsync: {}, ts: {:.3}, ts2: {:.3}, diff: {:.3}", (attitude.vsync - first_vsync), frame_timestamp * 1000.0, (frame_relative_ts as f64 / ratio), (frame_relative_ts as f64 / ratio) - (frame_timestamp * 1000.0));
-
-                                // let frame_ratio = self.frame_readout_time.unwrap() / vsync_duration;
-
-                                // let offset_ms = (1000.0 / sample_rate) * attitude.offset as f64;
-
+                                let mut readings = Vec::new();
                                 for (i, q) in attitude.attitude.iter().enumerate() {
-                                    let index = i as f64 - attitude.offset as f64;
-                                    let quat_ts = frame_timestamp + ((index / len) * vsync_duration);
-
-                                    /*let ts = match std::env::var("OFFSET_METHOD").as_deref() {
-                                        Ok("1.3.0") => {
-                                            quat_ts - (exposure_time / 2.0)
-                                        },
-                                        Ok("no-exp") => {
-                                            quat_ts
-                                        },
-                                        Ok("global-quat-index") => {
-                                            (global_quat_i as f64 - attitude.offset as f64) * (1000.0 / sample_rate)
-                                        },
-                                        Ok("global-quat-index-with-readout-time") => {
-                                            (global_quat_i as f64 - attitude.offset as f64) * (1000.0 / sample_rate) - (self.frame_readout_time.unwrap() / 2.0)
-                                        },
-                                        Ok("with-readout-time") => {
-                                            quat_ts - (self.frame_readout_time.unwrap() / 2.0)
-                                        },
-                                        // Default, if no env var
-                                        _ => {
-                                            quat_ts - exposure_time
-                                        }
-                                    };*/
-
-                                    let ts = quat_ts / fps_ratio;
-
-                                    // let ts = (quat_ts1 - exposure_time) / fps_ratio;
-                                    // println!("ts: {:.2}, diff: {:.4}, vsync: {}, frame_timestamp: {}, fts: {frame_timestamp}, fts2: {frame_timestamp2}", ts, ts - prev_ts, attitude.vsync, frame_ts);
-                                    prev_ts = ts;
-
-                                    // global_quat_i += 1;
-
-                                    if q.quaternion_w.is_nan() || q.quaternion_x.is_nan() || q.quaternion_y.is_nan() || q.quaternion_z.is_nan() {
-                                        continue;
-                                    }
-
-                                    let quat = util::multiply_quats(
-                                        (q.quaternion_w as f64,
-                                        q.quaternion_x as f64,
-                                        q.quaternion_y as f64,
-                                        q.quaternion_z as f64),
-                                        (0.5, -0.5, -0.5, 0.5),
-                                    );
-                                    // Rotate Y axis 180 deg for horizon lock
+                                    if ![q.quaternion_w, q.quaternion_x, q.quaternion_y, q.quaternion_z].into_iter().all(f32::is_finite) { continue; }
+                                    let quat = util::multiply_quats((q.quaternion_w as f64, q.quaternion_x as f64, q.quaternion_y as f64, q.quaternion_z as f64), (0.5, -0.5, -0.5, 0.5));
                                     let quat = util::multiply_quats((0.0, 0.0, 1.0, 0.0), (quat.w, quat.x, quat.y, quat.z));
-
-                                    if quat.w == 0.0 && quat.x == 0.0 && quat.y == 0.0 && quat.z == 0.0 {
-                                        continue;
-                                    }
-
-                                    if prev_quat.is_some() && (prev_quat.unwrap() - quat).norm_squared().sqrt() > 1.5 {
-                                        inv = !inv;
-                                    }
-                                    prev_quat = Some(quat.clone());
-
-                                    quats.push(TimeQuaternion {
-                                        t: ts,
-                                        v: if inv { -quat } else { quat },
-                                    });
+                                    if quat.norm_squared() == 0.0 { continue; }
+                                    if prev_quat.is_some_and(|previous| (previous - quat).norm_squared().sqrt() > 1.5) { inv = !inv; }
+                                    prev_quat = Some(quat);
+                                    readings.push(((i as f64 - attitude.offset as f64) / len, if inv { -quat } else { quat }));
                                 }
-
-                                if info.sample_index == 0 { log::debug!("Quaternions: {:?}", &quats); }
-                                util::insert_tag(&mut tag_map, tag!(parsed GroupId::Quaternion, TagId::Data, "Quaternion data",  Vec_TimeQuaternion_f64, |v| format!("{:?}", v), quats, vec![]), &options);
+                                held_quaternions.push(HeldQuaternions { sample: samples.len(), frame_relative_us: frame_relative_ts, readings });
                             }
                         }
                     }
@@ -267,6 +205,18 @@ impl Dji {
                 },
             }
         }, cancel_flag)?;
+
+        let video_fps = video_frame_rate(&ctx).filter(|fps| fps.is_finite() && *fps > 0.0).unwrap_or(fps);
+        let sensor_fps = timing::sensor_rate(&frames, 1000.0 / video_fps, stated_sensor_fps).unwrap_or(video_fps);
+        if let Some(readout) = self.frame_readout_time.as_mut() { *readout /= video_fps / sensor_fps; }
+        let first_frame_ms = first_timestamp.map_or(0.0, |(_, ms)| ms);
+        for held in held_quaternions {
+            let sample = held.sample;
+            let data = held.timed(first_frame_ms, sensor_fps, video_fps);
+            if let Some(map) = samples.get_mut(sample).and_then(|sample| sample.tag_map.as_mut()) {
+                insert_tag(map, tag!(parsed GroupId::Quaternion, TagId::Data, "Quaternion data", Vec_TimeQuaternion_f64, |v| format!("{:?}", v), data, vec![]), &options);
+            }
+        }
 
         match (samples.first_mut(), focal_length, distortion_coeffs) {
             (Some(sample), Some(focal_length), Some(coeffs)) if coeffs.len() >= 4 => {

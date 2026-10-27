@@ -161,8 +161,7 @@ impl GoPro {
                             continue; // go inside these boxes
                         } else {
                             if typ == fourcc("SETT") {
-                                let mut buf = vec![0u8; size as usize - header_size as usize];
-                                stream.read_exact(&mut buf)?;
+                                let buf = util::read_box_data(stream, size, header_size)?;
                                 if buf.len() > 8 {
                                     match buf[5] {
                                         0x00 => util::insert_tag(first_map, tag!(parsed GroupId::Default, TagId::Unknown(0x45495341), "EISA", String, |v| v.clone(), "N".into(), vec![]), &options),
@@ -370,40 +369,76 @@ impl GoPro {
             }
         }
     }
+    pub(crate) fn imu_start_times_ms(samples: &[SampleInfo]) -> (f64, f64, f64) {
+        let first = samples.iter().filter_map(|s| s.tag_map.as_ref().map(|m| (s, m)))
+            .find(|(_, m)| m.contains_key(&GroupId::Gyroscope));
+        let Some((packet, tags)) = first else { return (0.0, 0.0, 0.0) };
+        let stamp = |g: &TagMap| (g.get_t(TagId::TimestampUs) as Option<&u64>).copied().filter(|v| *v > 0);
+        // The streams of the video frames, whose stamps GPMF_utils' callers pass as the time base: the exposure time
+        // (SHUT), which gpmf-parser's demo takes, else the sensor ISO (ISOE), both written once per frame
+        let video = [KLV::group_from_key(b"SHUT"), KLV::group_from_key(b"ISOE")].iter()
+            .find_map(|g| tags.get(g).and_then(stamp));
+        // Without STMP the readings start with the packet, at its time in the clip
+        let packet_ms = packet.timestamp_ms;
+        let Some(base) = video.or_else(|| tags.values().filter_map(stamp).min()) else { return (packet_ms, packet_ms, packet_ms) };
+        let offset = |group: GroupId| samples.iter().filter_map(|s| s.tag_map.as_ref()?.get(&group))
+            .find_map(stamp).map_or(packet_ms, |t| packet_ms + (t as f64 - base as f64) / 1000.0);
+        (offset(GroupId::Gyroscope), offset(GroupId::Accelerometer), offset(GroupId::Magnetometer))
+    }
+    pub(crate) fn stamp_us(map: &TagMap) -> Option<i64> {
+        (map.get_t(TagId::TimestampUs) as Option<&u64>).map(|t| *t as i64)
+            .or_else(|| (map.get_t(TagId::TimestampMs) as Option<&u64>).map(|t| (*t as i64) * 1000))
+            .or_else(|| (map.get_t(TagId::Unknown(0x5449434b /*TICK*/)) as Option<&u32>).map(|t| (*t as i64) * 1000))
+    }
     pub fn get_avg_sample_duration(samples: &Vec<SampleInfo>, group_id: &GroupId) -> Option<f64> {
+        // Without stamps, the time of the packets that hold readings of the sensor: its readings span them. A packet that the
+        // track delivers without any, whose stream of the sensor is empty (as cameras write them) or missing, is no time of
+        // theirs, as the timeline puts the readings after it at their own packet's time (`util::time_before_readings`)
         let mut total_duration_ms = 0.0;
 
-        let mut first_tsus = None;
-        let mut last_tsus = None;
+        // The readings between one packet's timestamp and the next one's, over the packets the track delivered one
+        // after another: across packets it didn't deliver (`util::time_missing_between`) the time between the stamps
+        // is also theirs, whose readings aren't here. A packet without readings starts no such span, as the time from
+        // its stamp to the next one is none of theirs: the sensor gave none then. Cameras write an empty stream without
+        // a stamp (a HERO8 whose IMU stops after its first packet keeps a TSMP and nothing else), but a stamp there
+        // would put the time to the next one on no readings. Their counts are the readings delivered rather than the
+        // TSMP totals, which some packets of a HERO5 Session and a HERO10 raise by 4 to 12 fewer than they hold
+        let mut stamped_us = 0i64;
+        let mut stamped_count = 0;
+        let mut previous: Option<(&SampleInfo, i64, usize)> = None;
         let mut count = 0;
-        let mut last_len = 0;
         for info in samples {
-            total_duration_ms += info.duration_ms;
             if info.tag_map.is_none() { continue; }
             for (group, map) in info.tag_map.as_ref().unwrap() {
                 if group == group_id {
-                    if let Some(t) = map.get_t(TagId::TimestampUs) as Option<&u64> {
-                        if first_tsus.is_none() { first_tsus = Some(*t as i64); }
-                        last_tsus = Some(*t as i64);
-                    } else if let Some(t) = map.get_t(TagId::TimestampMs) as Option<&u64> {
-                        if first_tsus.is_none() { first_tsus = Some((*t as i64) * 1000); }
-                        last_tsus = Some((*t as i64) * 1000);
-                    } else if let Some(t) = map.get_t(TagId::Unknown(0x5449434b /*TICK*/)) as Option<&u32> {
-                        if first_tsus.is_none() { first_tsus = Some((*t as i64) * 1000); }
-                        last_tsus = Some((*t as i64) * 1000);
-                    }
+                    let tsus = Self::stamp_us(map);
+                    let mut len = 0;
                     if let Some(t) = map.get_t(TagId::Data) as Option<&Vec<Vector3<i16>>> {
-                        count += t.len();
-                        last_len = t.len();
+                        len = t.len();
+                    } else if let Some(t) = map.get_t(TagId::Data) as Option<&Vec<Vector3<f32>>> {
+                        // Fusion stores floating-point IMU readings. Their clock
+                        // uses the same STMP/TICK and sample-count rule as i16.
+                        len = t.len();
                     } else if let Some(t) = map.get_t(TagId::Data) as Option<&Vec<Quaternion<i16>>> {
-                        count += t.len();
-                        last_len = t.len();
+                        len = t.len();
+                    }
+                    count += len;
+                    if len > 0 {
+                        total_duration_ms += info.duration_ms;
+                    }
+                    if let Some(tsus) = tsus {
+                        if let Some((previous_info, previous_tsus, previous_len)) = previous
+                            && previous_len > 0 && util::time_missing_between(previous_info, info) == 0.0 {
+                            stamped_us += tsus - previous_tsus;
+                            stamped_count += previous_len;
+                        }
+                        previous = Some((info, tsus, len));
                     }
                 }
             }
         }
-        if first_tsus.is_some() && last_tsus.is_some() && count > 0 && last_tsus.unwrap() > first_tsus.unwrap() {
-            Some((last_tsus.unwrap() as f64 - first_tsus.unwrap() as f64) / (count - last_len).max(1) as f64 / 1000.0)
+        if stamped_us > 0 && stamped_count > 0 {
+            Some(stamped_us as f64 / stamped_count as f64 / 1000.0)
         } else if count > 0 {
             Some(total_duration_ms / count as f64)
         } else {

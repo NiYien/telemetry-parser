@@ -61,13 +61,11 @@ impl Vuze {
                 continue; // go inside these boxes
             } else {
                 if typ == fourcc("modl") { // Model
-                    let mut buf = vec![0u8; size as usize - header_size as usize];
-                    stream.read_exact(&mut buf)?;
+                    let buf = util::read_box_data(stream, size, header_size)?;
                     self.model = Some(String::from_utf8_lossy(&buf).trim_start_matches("Vuze").to_string());
                 }
                 if typ == fourcc("rcrp") { // Right camera crop
-                    let mut buf = vec![0u8; size as usize - header_size as usize];
-                    stream.read_exact(&mut buf)?;
+                    let buf = util::read_box_data(stream, size, header_size)?;
                     let rect = String::from_utf8_lossy(&buf).split(' ').filter_map(|x| x.parse::<i32>().ok()).collect::<Vec<i32>>();
                     if rect.len() == 4 {
                         width = rect[2];
@@ -75,8 +73,7 @@ impl Vuze {
                     }
                 }
                 if typ == fourcc("cali") { // Calibration YAML
-                    let mut buf = vec![0u8; size as usize - header_size as usize];
-                    stream.read_exact(&mut buf)?;
+                    let buf = util::read_box_data(stream, size, header_size)?;
                     let calib = String::from_utf8_lossy(&buf).to_string().replace("%YAML:1.0", "");
 
                     match serde_yaml::from_str(calib.trim()) as serde_yaml::Result<serde_json::Value> {
@@ -94,9 +91,8 @@ impl Vuze {
                     }
                 }
                 if typ == fourcc("bmdt") { // IMU data
-                    let buflen = size as usize - header_size as usize;
-                    let mut buf = vec![0u8; buflen];
-                    stream.read_exact(&mut buf)?;
+                    let buf = util::read_box_data(stream, size, header_size)?;
+                    let buflen = buf.len();
 
                     // Data example:
                     // 0C00 01 00 60EA0000 E9030000 5A 3D

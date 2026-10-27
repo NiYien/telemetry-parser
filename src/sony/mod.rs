@@ -27,6 +27,9 @@ pub struct Sony {
     frame_readout_time: Option<f64>,
     mvhd_creation_time: Option<String>,
 }
+
+#[cfg(test)]
+mod bugfix_tests;
 impl Sony {
     pub fn camera_type(&self) -> String {
         "Sony".to_owned()
@@ -125,7 +128,7 @@ impl Sony {
     }
 
     fn process_map(&mut self, samples: &mut Vec<SampleInfo>, options: &crate::InputOptions, video_md: Option<&VideoMetadata>, mxf_creation_time: Option<&str>, mxf_creation_subsec: Option<&str>) {
-        // Phase 0: existing RTMD logic (unchanged)
+        let mut cooke_error_logged = false;
         for sample in samples.iter_mut() {
             if let Some(ref mut map) = sample.tag_map {
                 if map.contains_key(&GroupId::Accelerometer) {
@@ -159,15 +162,22 @@ impl Sony {
                     }
                 }
                 if let Some(cooke) = map.get_mut(&GroupId::Cooke) {
+                    // The Cooke /i lens responses are decoded when they're read. Until the clip's first problem, they're checked
+                    // here as well, without building the records, so that it's logged once per clip rather than in every frame
+                    // that is read
+                    if let Some(v) = cooke.get_mut(&TagId::Data) && let TagValue::Unknown(x) = &mut v.value {
+                        let data = std::mem::take(&mut x.raw_data);
+                        if !cooke_error_logged { Self::log_cooke_errors(&crate::cooke::bin::errors(&data), &mut cooke_error_logged); }
+                        v.value = TagValue::Json(ValueType::new(|d| Ok(Self::cooke_records(d.get_ref(), &mut true)), |v| format!("{:?}", v), data));
+                    }
                     let mut cooke_data: Vec<u8> = Vec::new();
                     if let Some(v) = cooke.get(&TagId::Unknown(0xe208)) { if let TagValue::Unknown(x) = &v.value { cooke_data.extend(&x.raw_data); } }
                     if let Some(v) = cooke.get(&TagId::Unknown(0xe209)) { if let TagValue::Unknown(x) = &v.value { cooke_data.extend(&x.raw_data); } }
                     if !cooke_data.is_empty() {
                         cooke.remove(&TagId::Unknown(0xe208));
                         cooke.remove(&TagId::Unknown(0xe209));
-                        cooke.insert(TagId::Data2, tag!(GroupId::Cooke, TagId::Data2, "BinaryMetadata2", Json, "{:?}", |d| {
-                            Ok(serde_json::Value::Array(crate::cooke::bin::parse(d.get_ref()).unwrap())) // TODO: unwrap
-                        }, cooke_data));
+                        if !cooke_error_logged { Self::log_cooke_errors(&crate::cooke::bin::errors(&cooke_data), &mut cooke_error_logged); }
+                        cooke.insert(TagId::Data2, tag!(GroupId::Cooke, TagId::Data2, "BinaryMetadata2", Json, "{:?}", |d| Ok(Self::cooke_records(d.get_ref(), &mut true)), cooke_data));
                     }
                 }
             }
@@ -360,6 +370,30 @@ impl Sony {
 
         if let Some(ref mut map) = samples.first_mut().and_then(|s| s.tag_map.as_mut()) {
             util::insert_tag(map, tag!(parsed GroupId::Default, TagId::RecordFrameRate, "Record frame rate", f64, |v| format!("{:.3} fps", v), record_fps, Vec::new()), options);
+        }
+    }
+
+    /// The records of the Cooke /i lens responses in `data`, as far as they can be decoded, or null (as a tag that can't be
+    /// parsed) when none can. Their problems are logged ([`Self::log_cooke_errors`])
+    fn cooke_records(data: &[u8], error_logged: &mut bool) -> serde_json::Value {
+        let responses = crate::cooke::bin::parse(data);
+        Self::log_cooke_errors(&responses.errors, error_logged);
+        if responses.records.is_empty() && !responses.errors.is_empty() {
+            return serde_json::Value::Null;
+        }
+        serde_json::Value::Array(responses.records)
+    }
+
+    /// Logs the problems of a clip's Cooke /i lens responses: the first one as a warning, the others (usually the same, in the
+    /// next frames, when they're read) at debug level
+    fn log_cooke_errors(errors: &[Error], error_logged: &mut bool) {
+        for e in errors {
+            if !*error_logged {
+                log::warn!("Sony: {e}");
+                *error_logged = true;
+            } else {
+                log::debug!("Sony: {e}");
+            }
         }
     }
 
