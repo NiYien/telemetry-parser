@@ -215,8 +215,7 @@ fn fixed_data(mut d: &[u8]) -> Result<Value> {
             b'O' => { json.insert("Owner".into(),        text(&field(d, 31)?).into()); 31 },
             b'L' => { json.insert("LensType".into(),     if field(d, 1)? == b"Z" { "zoom" } else { "prime" }.into()); 1 },
             b'N' | b'n' if s4i_prime => {
-                let v = number(d, 3)? as i32;
-                json.insert("InfinityNodalDistance".into(), (if tag == b'n' { -v } else { v }).into());
+                let _ = number(d, 3)?;
                 3
             },
             b'N' | b'f' => { s4i_prime = tag == b'f'; json.insert("MinFocalLength".into(), number(d, 3)?.into()); 3 },
@@ -226,8 +225,7 @@ fn fixed_data(mut d: &[u8]) -> Result<Value> {
             b'E' => {
                 let sign = field(d, 1)?[0];
                 if sign != b'+' && sign != b'-' { return Err(invalid("N response entrance pupil position without a sign", d)); }
-                let v = number(&d[1..], 3)? as i32;
-                json.insert("EntrancePupilPosition".into(), (if sign == b'-' { -v } else { v }).into());
+                let _ = number(&d[1..], 3)?;
                 4
             },
             b'B' => { json.insert("FirmwareVersion".into(), text(&field(d, 4)?).into()); 4 },
@@ -240,18 +238,13 @@ fn fixed_data(mut d: &[u8]) -> Result<Value> {
     Ok(Value::Object(json))
 }
 
-/// 5.1.3 Kd: one set of packed binary lens data, after its tag, and the variations of earlier firmware (Part II, A.1.3).
+/// 5.1.3 Kd: one set of packed binary lens data after its tag, with the recorded serial number.
 /// Also the lens data of the Kdi response. Without `build`, it only checks the layout, and gives null
 fn lens_data(d: &[u8], build: bool) -> Result<Value> {
-    if d.len() < 26 { return Err(invalid("truncated Kd response", d)); }
+    if d.len() < 36 { return Err(invalid("truncated Kd response", d)); }
     let (v, rest) = d.split_at(26);
-    // The normalized zoom value is 10 bits in 2 bytes (0.000 to 1.000), 7 bits in 1 byte in S4/i zooms up to 1.21 and 1.30
-    // (0.00 to 1.00), absent in early S4/i primes; the serial number is absent before 0.21, 0.34, 0.22 and 1.31. The first byte
-    // of a 2-byte zoom value is 0x40 to 0x4F and the 1-byte one is 0x80 or more, so neither is the `S` of the serial number
+    // Keep the supported layouts with a nine-byte serial number, with or without a two-byte zoom value.
     let (zoom, serial) = match rest {
-        []                            => (None, None),
-        [z]                           => (Some(b7(*z) as f32 / 100.0), None),
-        [z1, z2]                      => (Some(((b4(*z1) << 6) | b6(*z2)) as f32 / 1000.0), None),
         [b'S', s @ ..] if s.len() == 9 => (None, Some(s)),
         [z1, z2, b'S', s @ ..] if s.len() == 9 => (Some(((b4(*z1) << 6) | b6(*z2)) as f32 / 1000.0), Some(s)),
         _ => return Err(invalid("unknown Kd response layout", d)),
@@ -355,7 +348,7 @@ mod tests {
 
     #[test]
     fn empty_responses_are_skipped() {
-        let kd = [&b"d"[..], &[b'@'; 26], END].concat();
+        let kd = [&b"d"[..], &[b'@'; 26], b"S123456789", END].concat();
         for field in [[&kd[..], END, &[0; 8]].concat(), [END, &kd[..]].concat(), [&kd[..], END, END, &kd[..]].concat()] {
             let responses = parse(&field);
             assert!(responses.errors.is_empty() && errors(&field).is_empty(), "{:?}", responses.errors);
@@ -365,7 +358,7 @@ mod tests {
 
     #[test]
     fn malformed_responses_keep_following_lens_data_and_truncated_packets_do_not_panic() {
-        let good = [&b"d"[..], &[b'@'; 26], END].concat();
+        let good = [&b"d"[..], &[b'@'; 26], b"S123456789", END].concat();
         let parsed = parse(&[&b"unknown"[..], END, &good].concat());
         assert_eq!(parsed.records.len(), 1);
         assert_eq!(parsed.errors.len(), 1);
@@ -389,5 +382,28 @@ mod tests {
         let parsed = parse(&data);
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         assert_eq!(parsed.records.len(), 3);
+    }
+
+    #[test]
+    fn unsupported_short_layouts_are_skipped_without_hiding_supported_responses() {
+        let valid = [&b"d"[..], &[b'@'; 26], b"S123456789", END].concat();
+        for size in [26, 27, 28] {
+            let short = [&b"d"[..], &vec![b'@'; size], END].concat();
+            let parsed = parse(&[short, valid.clone()].concat());
+            assert_eq!(parsed.errors.len(), 1);
+            assert_eq!(parsed.records.len(), 1);
+            assert_eq!(parsed.records[0]["SerialNumber"], "123456789");
+        }
+    }
+
+    #[test]
+    fn additional_fixed_fields_are_only_skipped_and_do_not_replace_focal_length() {
+        let parsed = parse(b"Nf032N123n456E+012B7.63\n\r");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0]["MinFocalLength"], 32);
+        assert_eq!(parsed.records[0]["FirmwareVersion"], "7.63");
+        assert!(parsed.records[0].get("InfinityNodalDistance").is_none());
+        assert!(parsed.records[0].get("EntrancePupilPosition").is_none());
     }
 }
